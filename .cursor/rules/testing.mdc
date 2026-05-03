@@ -1,0 +1,16 @@
+---
+description: "Testing expectations for RustyGate source and integration tests."
+globs: "tests/**/*.rs,src/**/*.rs"
+alwaysApply: false
+---
+
+# Testing
+
+- Add tests for meaningful logic, especially routing, config, metrics, token/cost estimation, and fallback.
+- Prefer integration tests for HTTP endpoints.
+- Avoid tests that depend on real external provider APIs.
+- Use mock providers or mock HTTP servers for provider behavior.
+- Test failure cases, not just happy paths.
+- Keep test data explicit and readable.
+- Ensure examples remain valid JSON.
+- Required coverage areas include config parsing, health, readiness, chat success, invalid chat requests, mock failure, fallback behavior, all providers failed, metrics aggregation, cost estimation, and request ID propagation.

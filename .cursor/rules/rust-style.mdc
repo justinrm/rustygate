@@ -1,0 +1,18 @@
+---
+description: "Rust style guidance for RustyGate source and tests."
+globs: "src/**/*.rs,tests/**/*.rs"
+alwaysApply: false
+---
+
+# Rust Style
+
+- Use idiomatic, stable Rust with clear module boundaries.
+- Prefer small modules and direct names over generic framework layers.
+- Avoid unnecessary cloning; clone only when ownership clarity or async boundaries require it.
+- Use `Result` types instead of panics in application logic.
+- Use `thiserror` for domain errors.
+- Use `anyhow` only at the binary/application startup boundary.
+- Keep async functions readable and avoid blocking work inside handlers.
+- Document structs and enums that represent public project concepts.
+- Mentally run `cargo fmt` and `cargo clippy` when generating code.
+- Add unit tests for business logic and integration tests for HTTP behavior.

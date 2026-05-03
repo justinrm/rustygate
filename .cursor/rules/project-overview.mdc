@@ -1,0 +1,17 @@
+---
+description: "Core RustyGate project scope, mission, and non-goals."
+alwaysApply: true
+---
+
+# Project Overview
+
+RustyGate is a lightweight Rust LLM inference gateway portfolio project. It should demonstrate async Rust web services, provider abstraction, routing, fallback, observability, token/cost estimates, and clean tests.
+
+- Keep the project small, polished, and documentation-first.
+- Avoid heavy infrastructure unless the user explicitly requests it.
+- Prefer simple, testable implementations over broad abstractions.
+- Preserve a simplified OpenAI-compatible shape where practical.
+- Favor readable, documented Rust over clever Rust.
+- Ask before adding major dependencies or framework layers.
+- Keep secrets out of logs, examples, docs, and commits.
+- Do not build streaming, Kubernetes, Redis, dashboards, multi-user billing, semantic caching, or full OpenAI compatibility during the MVP.

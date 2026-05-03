@@ -1,0 +1,17 @@
+---
+description: "API shape and route design rules for RustyGate."
+globs: "src/routes/**/*.rs,src/models/**/*.rs,docs/**/*.md,examples/**/*.json"
+alwaysApply: false
+---
+
+# API Design
+
+- Preserve simplified OpenAI-compatible chat completion request and response shapes.
+- Validate incoming requests before provider routing.
+- Return clean JSON errors and avoid leaking internal errors to clients.
+- Include request IDs in responses and error bodies when available.
+- Keep `/health` and `/ready` lightweight.
+- Keep examples synchronized with actual request and response structs.
+- Core request fields: required `model`, non-empty `messages`, `role`, `content`, optional `temperature`, optional `max_tokens`.
+- Valid roles are `system`, `user`, and `assistant`.
+- Core response fields: `id`, `object`, `created`, `model`, `provider`, `choices`, and `usage`.

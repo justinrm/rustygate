@@ -1,0 +1,6 @@
+{
+  "model": "mock-fast-v1",
+  "messages": [],
+  "temperature": 0.2,
+  "max_tokens": 128
+}

@@ -1,0 +1,15 @@
+{
+  "model": "mock-fast-v1",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a concise assistant."
+    },
+    {
+      "role": "user",
+      "content": "Explain what an inference gateway does in two sentences."
+    }
+  ],
+  "temperature": 0.2,
+  "max_tokens": 128
+}

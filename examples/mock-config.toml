@@ -1,0 +1,40 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[gateway]
+# Default timeout for outbound HTTP calls in real providers.
+default_timeout_ms = 15000
+# Reserved for future same-provider retry support; current fallback tries each matching provider once.
+max_retries = 1
+# Emits structured request metadata without prompt content.
+enable_request_logging = true
+# Local development only: stores prompt messages in request logs when true.
+log_prompt_content = false
+
+[storage]
+# Optional SQLite request log persistence. In-memory metrics remain the default when disabled.
+enabled = false
+database_url = "sqlite://rustygate.db"
+
+[[providers]]
+name = "mock-low-latency"
+kind = "mock"
+model = "mock-fast-v1"
+priority = 1
+# Mock providers fail only when failure_rate is 1.0; fractional rates are reserved.
+failure_rate = 0.0
+# Reserved for future latency simulation.
+base_latency_ms = 0
+cost_per_1k_input_tokens = 0.0001
+cost_per_1k_output_tokens = 0.0002
+
+[[providers]]
+name = "mock-backup"
+kind = "mock"
+model = "mock-fast-v1"
+priority = 2
+failure_rate = 0.0
+base_latency_ms = 0
+cost_per_1k_input_tokens = 0.00008
+cost_per_1k_output_tokens = 0.00015

@@ -1,0 +1,12 @@
+target
+.git
+.github
+.cursor
+agent-transcripts
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.env
+.env.*
+!.env.example

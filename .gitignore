@@ -1,0 +1,17 @@
+/target/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*.swo
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log

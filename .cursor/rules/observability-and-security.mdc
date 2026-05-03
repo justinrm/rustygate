@@ -1,0 +1,19 @@
+---
+description: "Logging, metrics, configuration, and secret-safety rules."
+globs: "src/telemetry/**/*.rs,src/storage/**/*.rs,src/config.rs,src/**/*.rs"
+alwaysApply: false
+---
+
+# Observability And Security
+
+- Generate a request ID for each request.
+- Use structured `tracing` logs with fields rather than string-only logs.
+- Redact prompt content by default.
+- Never log API keys or Authorization headers.
+- Never commit `.env` files.
+- Track latency, success/failure, selected provider, fallback attempts, estimated tokens, and estimated cost.
+- Keep in-memory metrics simple for the MVP.
+- Use fixed-size buffers if storing recent request details in memory.
+- Make full prompt logging an explicit local-development-only option.
+- Prefer safe defaults in configuration.
+- Metrics should eventually include totals, error rate, average and p95 latency, provider counts, token estimates, and cost estimates.

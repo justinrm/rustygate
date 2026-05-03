@@ -1,0 +1,43 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[gateway]
+default_timeout_ms = 30000
+max_retries = 1
+enable_request_logging = true
+log_prompt_content = false
+
+[storage]
+enabled = false
+database_url = "sqlite://rustygate.db"
+
+[[providers]]
+name = "openai-primary"
+kind = "openai_compatible"
+model = "gpt-4o-mini"
+priority = 1
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+cost_per_1k_input_tokens = 0.00015
+cost_per_1k_output_tokens = 0.0006
+
+[[providers]]
+name = "mock-openai-backup"
+kind = "mock"
+model = "gpt-4o-mini"
+priority = 2
+failure_rate = 0.0
+base_latency_ms = 0
+cost_per_1k_input_tokens = 0.0
+cost_per_1k_output_tokens = 0.0
+
+[[providers]]
+name = "anthropic-primary"
+kind = "anthropic"
+model = "claude-3-5-sonnet-latest"
+priority = 1
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+cost_per_1k_input_tokens = 0.00015
+cost_per_1k_output_tokens = 0.00075
