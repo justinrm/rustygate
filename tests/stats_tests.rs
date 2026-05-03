@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     body::{to_bytes, Body},
-    http::{Request, StatusCode},
+    http::{header, Request, StatusCode},
 };
 use rustygate::{
     app::{self, AppState},
@@ -13,6 +13,8 @@ use rustygate::{
 };
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+const TEST_GATEWAY_KEY: &str = "test-gateway-key";
 
 #[tokio::test]
 async fn stats_endpoints_report_success_tokens_and_cost() {
@@ -33,6 +35,7 @@ async fn stats_endpoints_report_success_tokens_and_cost() {
                 .uri("/v1/chat/completions")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::from(
                     json!({
                         "model": "mock-fast-v1",
@@ -54,6 +57,7 @@ async fn stats_endpoints_report_success_tokens_and_cost() {
             Request::builder()
                 .uri("/stats")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -88,6 +92,7 @@ async fn stats_endpoints_report_success_tokens_and_cost() {
             Request::builder()
                 .uri("/stats/providers")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -148,6 +153,7 @@ async fn stats_endpoints_report_provider_failures() {
                 .uri("/v1/chat/completions")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::from(
                     json!({
                         "model": "mock-fast-v1",
@@ -169,6 +175,7 @@ async fn stats_endpoints_report_provider_failures() {
             Request::builder()
                 .uri("/stats")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -183,9 +190,14 @@ async fn stats_endpoints_report_provider_failures() {
     assert_eq!(stats_json["total_requests"], 1);
     assert_eq!(stats_json["successful_requests"], 0);
     assert_eq!(stats_json["failed_requests"], 1);
+    assert_eq!(stats_json["in_flight_requests"], 0);
     assert_eq!(stats_json["total_provider_attempts"], 1);
     assert_eq!(stats_json["fallback_attempts"], 0);
     assert_eq!(stats_json["error_rate"], 1.0);
+    assert_eq!(
+        stats_json["request_errors_by_category"]["provider_unavailable"],
+        1
+    );
     assert!(stats_json["avg_latency_ms"].as_f64().is_some());
     assert!(stats_json["p95_latency_ms"].as_f64().is_some());
     assert_eq!(stats_json["estimated_prompt_tokens"], 0);
@@ -200,6 +212,7 @@ async fn stats_endpoints_report_provider_failures() {
             Request::builder()
                 .uri("/stats/providers")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -221,6 +234,11 @@ async fn stats_endpoints_report_provider_failures() {
     );
     assert_eq!(provider_stats_json["errors_by_provider"]["mock-failing"], 1);
     assert_eq!(
+        provider_stats_json["provider_errors_by_provider_and_category"]["mock-failing"]
+            ["provider_unavailable"],
+        1
+    );
+    assert_eq!(
         provider_stats_json["fallback_attempts_by_provider"]["mock-failing"],
         Value::Null
     );
@@ -234,6 +252,77 @@ async fn stats_endpoints_report_provider_failures() {
             .as_f64()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_prometheus_scrape_output() {
+    let state = AppState::from_providers(vec![ProviderEntry {
+        priority: 1,
+        provider: Arc::new(MockProvider {
+            name: "mock-failing".into(),
+            model: "mock-fast-v1".into(),
+            failure_rate: 1.0,
+            base_latency_ms: 0,
+        }),
+        pricing: ProviderPricing::default(),
+    }]);
+
+    let app = app::router_with_state(state);
+    let chat_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/chat/completions")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
+                .body(Body::from(
+                    json!({
+                        "model": "mock-fast-v1",
+                        "messages": [
+                            {"role": "user", "content": "hello world"}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), StatusCode::BAD_GATEWAY);
+
+    let metrics_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(metrics_response.status(), StatusCode::OK);
+    let content_type = metrics_response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(content_type.starts_with("text/plain; version=0.0.4"));
+    let body = to_bytes(metrics_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(body.contains("rustygate_requests_total 1\n"));
+    assert!(body.contains("rustygate_requests_failed_total 1\n"));
+    assert!(body.contains("rustygate_in_flight_requests 0\n"));
+    assert!(body.contains("rustygate_request_errors_total{category=\"provider_unavailable\"} 1\n"));
+    assert!(body.contains(
+        "rustygate_provider_errors_total{provider=\"mock-failing\",category=\"provider_unavailable\"} 1\n"
+    ));
 }
 
 #[tokio::test]
@@ -264,6 +353,7 @@ async fn stats_endpoints_report_provider_attempts_and_fallbacks() {
                 .uri("/v1/chat/completions")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::from(
                     json!({
                         "model": "mock-fast-v1",
@@ -285,6 +375,7 @@ async fn stats_endpoints_report_provider_attempts_and_fallbacks() {
             Request::builder()
                 .uri("/stats")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -309,6 +400,7 @@ async fn stats_endpoints_report_provider_attempts_and_fallbacks() {
             Request::builder()
                 .uri("/stats/providers")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -375,6 +467,7 @@ async fn stats_count_invalid_chat_requests_without_provider_attempts() {
                 .uri("/v1/chat/completions")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::from(
                     json!({
                         "model": " ",
@@ -396,6 +489,7 @@ async fn stats_count_invalid_chat_requests_without_provider_attempts() {
             Request::builder()
                 .uri("/stats")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -424,6 +518,7 @@ async fn stats_count_invalid_chat_requests_without_provider_attempts() {
             Request::builder()
                 .uri("/stats/providers")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )

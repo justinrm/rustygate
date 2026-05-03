@@ -1,9 +1,12 @@
 pub mod app;
+pub mod compat;
 pub mod config;
 pub mod error;
 pub mod models;
 pub mod providers;
+pub mod rate_limit;
 pub mod routes;
 pub mod routing;
+pub mod server;
 pub mod storage;
 pub mod telemetry;

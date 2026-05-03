@@ -16,6 +16,7 @@ pub struct MetricsSnapshot {
     pub total_requests: u64,
     pub successful_requests: u64,
     pub failed_requests: u64,
+    pub in_flight_requests: u64,
     pub total_provider_attempts: u64,
     pub fallback_attempts: u64,
     pub error_rate: f64,
@@ -31,6 +32,8 @@ pub struct MetricsSnapshot {
     pub successes_by_provider: BTreeMap<String, u64>,
     pub errors_by_provider: BTreeMap<String, u64>,
     pub fallback_attempts_by_provider: BTreeMap<String, u64>,
+    pub request_errors_by_category: BTreeMap<String, u64>,
+    pub provider_errors_by_provider_and_category: BTreeMap<String, BTreeMap<String, u64>>,
     pub avg_latency_ms_by_provider: BTreeMap<String, f64>,
     pub p95_latency_ms_by_provider: BTreeMap<String, f64>,
 }
@@ -40,6 +43,7 @@ pub struct MetricsRegistry {
     pub total_requests: u64,
     pub successful_requests: u64,
     pub failed_requests: u64,
+    pub in_flight_requests: u64,
     pub total_provider_attempts: u64,
     pub fallback_attempts: u64,
     pub estimated_prompt_tokens: u64,
@@ -52,6 +56,8 @@ pub struct MetricsRegistry {
     successes_by_provider: BTreeMap<String, u64>,
     errors_by_provider: BTreeMap<String, u64>,
     fallback_attempts_by_provider: BTreeMap<String, u64>,
+    request_errors_by_category: BTreeMap<String, u64>,
+    provider_errors_by_provider_and_category: BTreeMap<String, BTreeMap<String, u64>>,
     provider_latency_samples_ms: BTreeMap<String, Vec<u64>>,
     provider_total_latency_ms: BTreeMap<String, u128>,
     latency_samples_ms: Vec<u64>,
@@ -59,6 +65,14 @@ pub struct MetricsRegistry {
 }
 
 impl MetricsRegistry {
+    pub fn begin_request(&mut self) {
+        self.in_flight_requests = self.in_flight_requests.saturating_add(1);
+    }
+
+    pub fn end_request(&mut self) {
+        self.in_flight_requests = self.in_flight_requests.saturating_sub(1);
+    }
+
     pub fn record_success(
         &mut self,
         provider_name: &str,
@@ -113,8 +127,23 @@ impl MetricsRegistry {
     }
 
     pub fn record_chat_failure(&mut self, latency_ms: u64, attempts: &[ProviderAttempt]) {
+        self.record_chat_failure_with_category(latency_ms, attempts, None);
+    }
+
+    pub fn record_chat_failure_with_category(
+        &mut self,
+        latency_ms: u64,
+        attempts: &[ProviderAttempt],
+        error_category: Option<&str>,
+    ) {
         self.total_requests += 1;
         self.failed_requests += 1;
+        if let Some(error_category) = error_category {
+            *self
+                .request_errors_by_category
+                .entry(error_category.to_string())
+                .or_default() += 1;
+        }
         self.total_latency_ms += u128::from(latency_ms);
         self.record_latency_sample(latency_ms);
         self.record_provider_attempts(attempts);
@@ -125,6 +154,7 @@ impl MetricsRegistry {
             total_requests: self.total_requests,
             successful_requests: self.successful_requests,
             failed_requests: self.failed_requests,
+            in_flight_requests: self.in_flight_requests,
             total_provider_attempts: self.total_provider_attempts,
             fallback_attempts: self.fallback_attempts,
             error_rate: self.error_rate(),
@@ -140,6 +170,10 @@ impl MetricsRegistry {
             successes_by_provider: self.successes_by_provider.clone(),
             errors_by_provider: self.errors_by_provider.clone(),
             fallback_attempts_by_provider: self.fallback_attempts_by_provider.clone(),
+            request_errors_by_category: self.request_errors_by_category.clone(),
+            provider_errors_by_provider_and_category: self
+                .provider_errors_by_provider_and_category
+                .clone(),
             avg_latency_ms_by_provider: self.avg_latency_ms_by_provider(),
             p95_latency_ms_by_provider: self.p95_latency_ms_by_provider(),
         }
@@ -168,6 +202,14 @@ impl MetricsRegistry {
                     .errors_by_provider
                     .entry(attempt.provider_name.clone())
                     .or_default() += 1;
+                if let Some(error_category) = attempt.error_category {
+                    *self
+                        .provider_errors_by_provider_and_category
+                        .entry(attempt.provider_name.clone())
+                        .or_default()
+                        .entry(error_category.as_str().to_string())
+                        .or_default() += 1;
+                }
             }
 
             if attempt.is_fallback {

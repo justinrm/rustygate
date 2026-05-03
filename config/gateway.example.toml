@@ -1,16 +1,45 @@
 [server]
 host = "127.0.0.1"
 port = 8080
+# Time to allow in-flight requests to finish after shutdown starts.
+shutdown_grace_period_ms = 10000
 
 [gateway]
 # Default timeout for outbound HTTP calls in real providers.
 default_timeout_ms = 30000
-# Reserved for future same-provider retry support; current fallback tries each matching provider once.
+# Number of retries to attempt on the same provider before fallback.
 max_retries = 1
 # Emits structured request metadata without prompt content.
 enable_request_logging = true
 # Local development only: stores prompt messages in request logs when true.
 log_prompt_content = false
+# Env var name that stores the gateway Bearer API key.
+api_key_env = "RUSTYGATE_GATEWAY_API_KEY"
+# Routing policies: priority, cost, or latency.
+routing_policy = "priority"
+# Public model aliases resolved before provider routing.
+model_aliases = { "mock-fast" = "mock-fast-v1" }
+
+[gateway.retry]
+initial_backoff_ms = 100
+max_backoff_ms = 2000
+jitter_ms = 50
+
+[gateway.circuit_breaker]
+failure_threshold = 3
+open_duration_ms = 5000
+half_open_max_probes = 1
+
+[gateway.rate_limit]
+global_requests_per_minute = 240
+global_burst_size = 60
+per_key_requests_per_minute = 120
+per_key_burst_size = 30
+
+[gateway.request_limits]
+max_chat_body_bytes = 65536
+max_messages_per_request = 64
+max_message_content_chars = 8000
 
 [storage]
 # Optional SQLite request log persistence. In-memory metrics remain the default when disabled.
@@ -26,6 +55,15 @@ priority = 1
 failure_rate = 0.0
 # Reserved for future latency simulation.
 base_latency_ms = 0
+# Optional overrides for this provider.
+timeout_ms = 5000
+max_retries = 2
+retry_initial_backoff_ms = 50
+retry_max_backoff_ms = 500
+retry_jitter_ms = 25
+circuit_breaker_failure_threshold = 2
+circuit_breaker_open_duration_ms = 3000
+circuit_breaker_half_open_max_probes = 1
 cost_per_1k_input_tokens = 0.0001
 cost_per_1k_output_tokens = 0.0002
 

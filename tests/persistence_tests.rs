@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, sync::Arc};
 
 use axum::{
     body::{to_bytes, Body},
-    http::{Request, StatusCode},
+    http::{header, Request, StatusCode},
 };
 use rustygate::{
     app::{self, AppState},
@@ -15,6 +15,8 @@ use rustygate::{
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+const TEST_GATEWAY_KEY: &str = "test-gateway-key";
 
 #[tokio::test]
 async fn sqlite_persists_successful_request_without_prompt_content() {
@@ -52,6 +54,7 @@ async fn sqlite_persists_successful_request_without_prompt_content() {
             Request::builder()
                 .uri("/stats")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -118,6 +121,7 @@ async fn sqlite_persists_fallback_provider_attempts() {
             Request::builder()
                 .uri("/stats/providers")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -143,6 +147,7 @@ fn chat_request(body: Value) -> Request<Body> {
         .uri("/v1/chat/completions")
         .method("POST")
         .header("content-type", "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
         .body(Body::from(body.to_string()))
         .unwrap()
 }

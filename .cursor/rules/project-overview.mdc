@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Project Overview
 
-RustyGate is a lightweight Rust LLM inference gateway portfolio project. It should demonstrate async Rust web services, provider abstraction, routing, fallback, observability, token/cost estimates, and clean tests.
+RustyGate is a lightweight Rust LLM inference gateway portfolio project. It demonstrates async Rust web services, provider abstraction, routing, fallback, streaming responses, observability, token/cost estimates, and clean tests.
 
 - Keep the project small, polished, and documentation-first.
 - Avoid heavy infrastructure unless the user explicitly requests it.
@@ -14,4 +14,5 @@ RustyGate is a lightweight Rust LLM inference gateway portfolio project. It shou
 - Favor readable, documented Rust over clever Rust.
 - Ask before adding major dependencies or framework layers.
 - Keep secrets out of logs, examples, docs, and commits.
-- Do not build streaming, Kubernetes, Redis, dashboards, multi-user billing, semantic caching, or full OpenAI compatibility during the MVP.
+- The MVP and post-MVP hardening are complete. Keep future work focused on validation, bugs, docs, and small hardening unless a new roadmap is explicitly opened.
+- Do not add Kubernetes, Redis, dashboards, multi-user billing, semantic caching, production policy engines, or full OpenAI compatibility without explicit approval.

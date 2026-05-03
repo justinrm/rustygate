@@ -1,0 +1,6 @@
+{
+  "model": "mock-fast-v1",
+  "input": "Explain what an inference gateway does in two sentences.",
+  "temperature": 0.2,
+  "max_output_tokens": 128
+}

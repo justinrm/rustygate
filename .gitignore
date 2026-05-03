@@ -6,6 +6,7 @@
 !.env.example
 
 # Editor and OS noise
+.cursor/
 .DS_Store
 *.swp
 *.swo

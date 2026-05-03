@@ -1,23 +1,36 @@
 use std::{
+    collections::{BTreeMap, HashMap},
     env,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use axum::{
+    extract::DefaultBodyLimit,
+    extract::{Request, State},
+    http::header::AUTHORIZATION,
+    middleware::{from_fn_with_state, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
+use uuid::Uuid;
 
 use crate::{
-    config::{AppConfig, ProviderKind},
+    config::{AppConfig, GatewayConfig, ProviderConfig, ProviderKind, RoutingPolicy},
+    error::AppError,
+    models::chat::ChatValidationLimits,
     providers::{
         anthropic::AnthropicProvider,
         mock::MockProvider,
         openai_compatible::OpenAiCompatibleProvider,
         provider::{ChatProvider, ProviderEntry, ProviderPricing},
     },
+    rate_limit::RateLimiter,
     routes,
+    routing::resilience::{
+        CircuitBreakerPolicy, ProviderResiliencePolicy, ResilienceRegistry, RetryPolicy,
+    },
     storage::sqlite::{SqliteRequestLogStore, StorageError},
     telemetry::{metrics::MetricsRegistry, request_log::RequestLoggingConfig},
 };
@@ -26,6 +39,8 @@ use crate::{
 pub enum AppStateInitError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("gateway configuration error: {message}")]
+    GatewayConfig { message: String },
     #[error("provider configuration error for `{provider}`: {message}")]
     ProviderConfig { provider: String, message: String },
 }
@@ -36,6 +51,30 @@ pub struct AppState {
     pub metrics: Arc<Mutex<MetricsRegistry>>,
     pub request_logging: RequestLoggingConfig,
     pub request_log_store: Option<Arc<SqliteRequestLogStore>>,
+    pub gateway_api_key: Arc<str>,
+    pub rate_limiter: RateLimiter,
+    pub resilience: Arc<ResilienceRegistry>,
+    pub chat_validation_limits: ChatValidationLimits,
+    pub max_chat_body_bytes: usize,
+    pub model_aliases: Arc<BTreeMap<String, String>>,
+    pub routing_policy: RoutingPolicy,
+}
+
+#[derive(Clone)]
+struct AuthenticatedApiKey(String);
+
+const DEFAULT_GATEWAY_API_KEY: &str = "test-gateway-key";
+
+fn default_gateway_api_key() -> Arc<str> {
+    Arc::<str>::from(DEFAULT_GATEWAY_API_KEY)
+}
+
+fn default_resilience_registry(provider_names: &[String]) -> Arc<ResilienceRegistry> {
+    Arc::new(ResilienceRegistry::new(
+        ProviderResiliencePolicy::default(),
+        HashMap::new(),
+        provider_names,
+    ))
 }
 
 impl Default for AppState {
@@ -45,6 +84,13 @@ impl Default for AppState {
             metrics: Arc::new(Mutex::new(MetricsRegistry::default())),
             request_logging: RequestLoggingConfig::default(),
             request_log_store: None,
+            gateway_api_key: default_gateway_api_key(),
+            rate_limiter: RateLimiter::new(&Default::default()),
+            resilience: default_resilience_registry(&[]),
+            chat_validation_limits: ChatValidationLimits::default(),
+            max_chat_body_bytes: 65_536,
+            model_aliases: Arc::new(BTreeMap::new()),
+            routing_policy: RoutingPolicy::Priority,
         }
     }
 }
@@ -53,22 +99,59 @@ impl AppState {
     pub fn from_providers(mut providers: Vec<ProviderEntry>) -> Self {
         providers.sort_by_key(|entry| entry.priority);
         Self {
+            resilience: default_resilience_registry(
+                &providers
+                    .iter()
+                    .map(|entry| entry.provider.name().to_string())
+                    .collect::<Vec<_>>(),
+            ),
             providers,
             metrics: Arc::new(Mutex::new(MetricsRegistry::default())),
             request_logging: RequestLoggingConfig::default(),
             request_log_store: None,
+            gateway_api_key: default_gateway_api_key(),
+            rate_limiter: RateLimiter::new(&Default::default()),
+            chat_validation_limits: ChatValidationLimits::default(),
+            max_chat_body_bytes: 65_536,
+            model_aliases: Arc::new(BTreeMap::new()),
+            routing_policy: RoutingPolicy::Priority,
         }
     }
 
     pub async fn from_config(config: &AppConfig) -> Result<Self, AppStateInitError> {
-        let timeout = Duration::from_millis(config.gateway.default_timeout_ms);
+        let gateway_api_key = env::var(&config.gateway.api_key_env).map_err(|_| {
+            AppStateInitError::GatewayConfig {
+                message: format!(
+                    "environment variable `{}` is not set for gateway API key",
+                    config.gateway.api_key_env
+                ),
+            }
+        })?;
+        if gateway_api_key.trim().is_empty() {
+            return Err(AppStateInitError::GatewayConfig {
+                message: format!(
+                    "environment variable `{}` for gateway API key must not be empty",
+                    config.gateway.api_key_env
+                ),
+            });
+        }
+
         let mut providers = Vec::with_capacity(config.providers.len());
+        let mut provider_policies = HashMap::with_capacity(config.providers.len());
 
         for provider in &config.providers {
+            let provider_policy = provider_resilience_policy(provider, &config.gateway);
+            provider_policies.insert(provider.name.clone(), provider_policy);
+
             let pricing = ProviderPricing {
                 cost_per_1k_input_tokens: provider.cost_per_1k_input_tokens,
                 cost_per_1k_output_tokens: provider.cost_per_1k_output_tokens,
             };
+            let timeout = Duration::from_millis(
+                provider
+                    .timeout_ms
+                    .unwrap_or(config.gateway.default_timeout_ms),
+            );
 
             let provider_impl: Arc<dyn ChatProvider> = match provider.kind {
                 ProviderKind::Mock => Arc::new(MockProvider {
@@ -159,6 +242,20 @@ impl AppState {
                 enabled: config.gateway.enable_request_logging,
                 log_prompt_content: config.gateway.log_prompt_content,
             });
+        state.gateway_api_key = Arc::from(gateway_api_key);
+        state.rate_limiter = RateLimiter::new(&config.gateway.rate_limit);
+        state.chat_validation_limits = ChatValidationLimits {
+            max_messages_per_request: config.gateway.request_limits.max_messages_per_request,
+            max_message_content_chars: config.gateway.request_limits.max_message_content_chars,
+        };
+        state.max_chat_body_bytes = config.gateway.request_limits.max_chat_body_bytes;
+        state.model_aliases = Arc::new(config.gateway.model_aliases.clone());
+        state.routing_policy = config.gateway.routing_policy;
+        state.resilience = Arc::new(ResilienceRegistry::new(
+            gateway_resilience_defaults(&config.gateway),
+            provider_policies,
+            &state.provider_names(),
+        ));
 
         if config.storage.enabled {
             let store = SqliteRequestLogStore::connect(&config.storage.database_url).await?;
@@ -186,28 +283,256 @@ impl AppState {
     }
 }
 
+fn gateway_resilience_defaults(gateway: &GatewayConfig) -> ProviderResiliencePolicy {
+    ProviderResiliencePolicy {
+        timeout_ms: Some(gateway.default_timeout_ms),
+        retry: RetryPolicy {
+            max_retries: gateway.max_retries,
+            initial_backoff_ms: gateway.retry.initial_backoff_ms,
+            max_backoff_ms: gateway.retry.max_backoff_ms,
+            jitter_ms: gateway.retry.jitter_ms,
+        },
+        breaker: CircuitBreakerPolicy {
+            failure_threshold: gateway.circuit_breaker.failure_threshold,
+            open_duration_ms: gateway.circuit_breaker.open_duration_ms,
+            half_open_max_probes: gateway.circuit_breaker.half_open_max_probes,
+        },
+    }
+}
+
+fn provider_resilience_policy(
+    provider: &ProviderConfig,
+    gateway: &GatewayConfig,
+) -> ProviderResiliencePolicy {
+    ProviderResiliencePolicy {
+        timeout_ms: provider.timeout_ms.or(Some(gateway.default_timeout_ms)),
+        retry: RetryPolicy {
+            max_retries: provider.max_retries.unwrap_or(gateway.max_retries),
+            initial_backoff_ms: provider
+                .retry_initial_backoff_ms
+                .unwrap_or(gateway.retry.initial_backoff_ms),
+            max_backoff_ms: provider
+                .retry_max_backoff_ms
+                .unwrap_or(gateway.retry.max_backoff_ms),
+            jitter_ms: provider.retry_jitter_ms.unwrap_or(gateway.retry.jitter_ms),
+        },
+        breaker: CircuitBreakerPolicy {
+            failure_threshold: provider
+                .circuit_breaker_failure_threshold
+                .unwrap_or(gateway.circuit_breaker.failure_threshold),
+            open_duration_ms: provider
+                .circuit_breaker_open_duration_ms
+                .unwrap_or(gateway.circuit_breaker.open_duration_ms),
+            half_open_max_probes: provider
+                .circuit_breaker_half_open_max_probes
+                .unwrap_or(gateway.circuit_breaker.half_open_max_probes),
+        },
+    }
+}
+
 pub fn router() -> Router {
     router_with_state(AppState::default())
 }
 
 pub fn router_with_state(state: AppState) -> Router {
+    let max_chat_body_bytes = state.max_chat_body_bytes;
+    let protected_routes = Router::new()
+        .route("/v1/responses", post(routes::compat::responses))
+        .route("/v1/chat/completions", post(routes::chat::chat_completions))
+        .route("/v1/embeddings", post(routes::compat::embeddings))
+        .route("/v1/moderations", post(routes::compat::moderations))
+        .route(
+            "/v1/images/generations",
+            post(routes::compat::image_generation),
+        )
+        .route("/v1/images/edits", post(routes::compat::image_edit))
+        .route(
+            "/v1/images/variations",
+            post(routes::compat::image_variation),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(routes::compat::audio_transcription),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(routes::compat::audio_translation),
+        )
+        .route(
+            "/v1/files",
+            get(routes::compat::list_files).post(routes::compat::create_file),
+        )
+        .route(
+            "/v1/files/{file_id}",
+            get(routes::compat::retrieve_file).delete(routes::compat::delete_file),
+        )
+        .route(
+            "/v1/files/{file_id}/content",
+            get(routes::compat::file_content),
+        )
+        .route(
+            "/v1/batches",
+            get(routes::compat::list_batches).post(routes::compat::create_batch),
+        )
+        .route(
+            "/v1/batches/{batch_id}",
+            get(routes::compat::retrieve_batch),
+        )
+        .route(
+            "/v1/batches/{batch_id}/cancel",
+            post(routes::compat::cancel_batch),
+        )
+        .route(
+            "/v1/fine_tuning/jobs",
+            get(routes::compat::list_fine_tuning_jobs).post(routes::compat::create_fine_tuning_job),
+        )
+        .route(
+            "/v1/fine_tuning/jobs/{job_id}",
+            get(routes::compat::retrieve_fine_tuning_job),
+        )
+        .route(
+            "/v1/fine_tuning/jobs/{job_id}/cancel",
+            post(routes::compat::cancel_fine_tuning_job),
+        )
+        .route(
+            "/v1/fine_tuning/jobs/{job_id}/events",
+            get(routes::compat::list_fine_tuning_events),
+        )
+        .route(
+            "/v1/realtime/sessions",
+            post(routes::compat::realtime_session),
+        )
+        .route("/v1/models", get(routes::models::list_models))
+        .route("/stats", get(routes::stats::stats))
+        .route("/stats/providers", get(routes::stats::provider_stats))
+        .route("/metrics", get(routes::stats::prometheus_metrics))
+        .layer(DefaultBodyLimit::max(max_chat_body_bytes))
+        .layer(from_fn_with_state(
+            state.clone(),
+            per_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(from_fn_with_state(
+            state.clone(),
+            pre_auth_rate_limit_middleware,
+        ));
+
     Router::new()
         .route("/health", get(routes::health::health))
         .route("/ready", get(routes::health::ready))
-        .route("/v1/chat/completions", post(routes::chat::chat_completions))
-        .route("/stats", get(routes::stats::stats))
-        .route("/stats/providers", get(routes::stats::provider_stats))
+        .merge(protected_routes)
         .with_state(state)
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(api_key) = bearer_token(&request) else {
+        return AppError::Unauthorized {
+            message: "missing bearer token".into(),
+            request_id: Some(Uuid::new_v4()),
+        }
+        .into_response();
+    };
+    let api_key = api_key.to_string();
+
+    if default_key_is_not_allowed(state.gateway_api_key.as_ref())
+        || !constant_time_eq(&api_key, state.gateway_api_key.as_ref())
+    {
+        return AppError::Unauthorized {
+            message: "invalid bearer token".into(),
+            request_id: Some(Uuid::new_v4()),
+        }
+        .into_response();
+    }
+
+    request
+        .extensions_mut()
+        .insert(AuthenticatedApiKey(api_key));
+    next.run(request).await
+}
+
+async fn pre_auth_rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(retry_after_seconds) = state.rate_limiter.check_global() {
+        return AppError::GatewayRateLimited {
+            request_id: Some(Uuid::new_v4()),
+            retry_after_seconds,
+        }
+        .into_response();
+    }
+
+    next.run(request).await
+}
+
+async fn per_key_rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let api_key = request
+        .extensions()
+        .get::<AuthenticatedApiKey>()
+        .map(|key| key.0.as_str())
+        .unwrap_or("unknown");
+
+    if let Err(retry_after_seconds) = state.rate_limiter.check_key(api_key) {
+        return AppError::GatewayRateLimited {
+            request_id: Some(Uuid::new_v4()),
+            retry_after_seconds,
+        }
+        .into_response();
+    }
+
+    next.run(request).await
+}
+
+fn bearer_token(request: &Request) -> Option<&str> {
+    let header = request.headers().get(AUTHORIZATION)?;
+    let header = header.to_str().ok()?;
+    let token = header.strip_prefix("Bearer ")?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+fn constant_time_eq(candidate: &str, expected: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let expected = expected.as_bytes();
+    let mut diff = candidate.len() ^ expected.len();
+
+    for (index, expected_byte) in expected.iter().enumerate() {
+        let candidate_byte = candidate.get(index).copied().unwrap_or_default();
+        diff |= usize::from(candidate_byte ^ *expected_byte);
+    }
+
+    diff == 0
+}
+
+fn default_key_is_not_allowed(configured_key: &str) -> bool {
+    !cfg!(debug_assertions) && configured_key == DEFAULT_GATEWAY_API_KEY
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use super::AppState;
-    use crate::providers::{
-        mock::MockProvider,
-        provider::{ChatProvider, ProviderEntry, ProviderPricing},
+    use crate::{
+        config::{
+            GatewayCircuitBreakerConfig, GatewayConfig, GatewayRetryConfig, ProviderConfig,
+            ProviderKind, RateLimitConfig, RequestLimitsConfig, RoutingPolicy,
+        },
+        providers::{
+            mock::MockProvider,
+            provider::{ChatProvider, ProviderEntry, ProviderPricing},
+        },
     };
 
     #[test]
@@ -243,5 +568,117 @@ mod tests {
                 "mock-third".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn provider_resilience_policy_uses_provider_overrides() {
+        let gateway = GatewayConfig {
+            default_timeout_ms: 30_000,
+            max_retries: 1,
+            routing_policy: RoutingPolicy::Priority,
+            model_aliases: BTreeMap::new(),
+            retry: GatewayRetryConfig {
+                initial_backoff_ms: 100,
+                max_backoff_ms: 500,
+                jitter_ms: 25,
+            },
+            circuit_breaker: GatewayCircuitBreakerConfig {
+                failure_threshold: 3,
+                open_duration_ms: 5_000,
+                half_open_max_probes: 1,
+            },
+            enable_request_logging: true,
+            log_prompt_content: false,
+            api_key_env: "RUSTYGATE_GATEWAY_API_KEY".into(),
+            rate_limit: RateLimitConfig::default(),
+            request_limits: RequestLimitsConfig::default(),
+        };
+        let provider = ProviderConfig {
+            name: "mock-primary".into(),
+            kind: ProviderKind::Mock,
+            model: "mock-fast-v1".into(),
+            priority: 1,
+            failure_rate: 0.0,
+            base_latency_ms: 0,
+            base_url: None,
+            api_key_env: None,
+            timeout_ms: Some(1_000),
+            max_retries: Some(5),
+            retry_initial_backoff_ms: Some(10),
+            retry_max_backoff_ms: Some(100),
+            retry_jitter_ms: Some(7),
+            circuit_breaker_failure_threshold: Some(6),
+            circuit_breaker_open_duration_ms: Some(2_000),
+            circuit_breaker_half_open_max_probes: Some(2),
+            cost_per_1k_input_tokens: 0.0,
+            cost_per_1k_output_tokens: 0.0,
+        };
+
+        let policy = super::provider_resilience_policy(&provider, &gateway);
+
+        assert_eq!(policy.timeout_ms, Some(1_000));
+        assert_eq!(policy.retry.max_retries, 5);
+        assert_eq!(policy.retry.initial_backoff_ms, 10);
+        assert_eq!(policy.retry.max_backoff_ms, 100);
+        assert_eq!(policy.retry.jitter_ms, 7);
+        assert_eq!(policy.breaker.failure_threshold, 6);
+        assert_eq!(policy.breaker.open_duration_ms, 2_000);
+        assert_eq!(policy.breaker.half_open_max_probes, 2);
+    }
+
+    #[test]
+    fn provider_resilience_policy_falls_back_to_gateway_defaults() {
+        let gateway = GatewayConfig {
+            default_timeout_ms: 20_000,
+            max_retries: 2,
+            routing_policy: RoutingPolicy::Priority,
+            model_aliases: BTreeMap::new(),
+            retry: GatewayRetryConfig {
+                initial_backoff_ms: 50,
+                max_backoff_ms: 500,
+                jitter_ms: 11,
+            },
+            circuit_breaker: GatewayCircuitBreakerConfig {
+                failure_threshold: 4,
+                open_duration_ms: 9_000,
+                half_open_max_probes: 3,
+            },
+            enable_request_logging: true,
+            log_prompt_content: false,
+            api_key_env: "RUSTYGATE_GATEWAY_API_KEY".into(),
+            rate_limit: RateLimitConfig::default(),
+            request_limits: RequestLimitsConfig::default(),
+        };
+        let provider = ProviderConfig {
+            name: "mock-primary".into(),
+            kind: ProviderKind::Mock,
+            model: "mock-fast-v1".into(),
+            priority: 1,
+            failure_rate: 0.0,
+            base_latency_ms: 0,
+            base_url: None,
+            api_key_env: None,
+            timeout_ms: None,
+            max_retries: None,
+            retry_initial_backoff_ms: None,
+            retry_max_backoff_ms: None,
+            retry_jitter_ms: None,
+            circuit_breaker_failure_threshold: None,
+            circuit_breaker_open_duration_ms: None,
+            circuit_breaker_half_open_max_probes: None,
+            cost_per_1k_input_tokens: 0.0,
+            cost_per_1k_output_tokens: 0.0,
+        };
+
+        let policy = super::provider_resilience_policy(&provider, &gateway);
+
+        assert_eq!(policy.timeout_ms, Some(20_000));
+        assert_eq!(policy.retry.max_retries, 2);
+        assert_eq!(policy.retry.initial_backoff_ms, 50);
+        assert_eq!(policy.retry.max_backoff_ms, 500);
+        assert_eq!(policy.retry.jitter_ms, 11);
+        assert_eq!(policy.breaker.failure_threshold, 4);
+        assert_eq!(policy.breaker.open_duration_ms, 9_000);
+        assert_eq!(policy.breaker.half_open_max_probes, 3);
     }
 }

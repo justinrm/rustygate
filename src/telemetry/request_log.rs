@@ -128,6 +128,7 @@ pub struct RequestLogEntry {
     pub route: String,
     pub created_at_unix_seconds: i64,
     pub requested_model: Option<String>,
+    pub stream: bool,
     pub final_provider: Option<String>,
     pub status: RequestLogStatus,
     pub latency_ms: u64,
@@ -158,6 +159,9 @@ impl RequestLogEntry {
             route: route.into(),
             created_at_unix_seconds: OffsetDateTime::now_utc().unix_timestamp(),
             requested_model: request.and_then(|request| request.model.clone()),
+            stream: request
+                .map(|request| request.stream_enabled())
+                .unwrap_or(false),
             final_provider,
             status,
             latency_ms,
@@ -246,6 +250,7 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            stream: None,
         }
     }
 }

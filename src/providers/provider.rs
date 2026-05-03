@@ -1,8 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::stream::BoxStream;
+use uuid::Uuid;
 
-use crate::models::chat::{ChatCompletionRequest, ChatCompletionResponse};
+use crate::models::chat::{
+    ChatCompletionChunkResponse, ChatCompletionRequest, ChatCompletionResponse, TokenUsage,
+};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
@@ -16,6 +20,37 @@ pub enum ProviderError {
     ProviderUnavailable,
     #[error("provider returned an invalid response")]
     ProviderBadResponse,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ProviderStreamError {
+    #[error("provider stream failed before first chunk")]
+    BeforeFirstChunk(ProviderError),
+    #[error("provider stream failed after partial response")]
+    MidStream(ProviderError),
+}
+
+impl ProviderStreamError {
+    pub fn into_provider_error(self) -> ProviderError {
+        match self {
+            Self::BeforeFirstChunk(error) | Self::MidStream(error) => error,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ProviderStreamEvent {
+    Chunk(ChatCompletionChunkResponse),
+    Completed { usage: TokenUsage },
+}
+
+pub type ProviderStream = BoxStream<'static, Result<ProviderStreamEvent, ProviderError>>;
+
+#[derive(Debug, Clone)]
+pub struct ProviderStreamContext {
+    pub response_id: Uuid,
+    pub created: i64,
+    pub model: String,
 }
 
 #[derive(Clone)]
@@ -61,12 +96,19 @@ impl ProviderPricing {
 pub trait ChatProvider: Send + Sync {
     fn name(&self) -> &str;
 
+    fn model(&self) -> &str;
+
     fn supports_model(&self, model: &str) -> bool;
 
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ProviderError>;
+
+    async fn chat_completion_stream(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError>;
 }
 
 #[cfg(test)]

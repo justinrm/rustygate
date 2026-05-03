@@ -3,11 +3,18 @@
 set -eu
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
+API_KEY="${RUSTYGATE_GATEWAY_API_KEY:-}"
+
+if [ -z "$API_KEY" ]; then
+  echo "FAIL RUSTYGATE_GATEWAY_API_KEY must be set for protected smoke checks"
+  exit 1
+fi
 
 TMP_CHAT="$(mktemp)"
+TMP_RESPONSES="$(mktemp)"
 TMP_STATS="$(mktemp)"
 cleanup() {
-  rm -f "$TMP_CHAT" "$TMP_STATS"
+  rm -f "$TMP_CHAT" "$TMP_RESPONSES" "$TMP_STATS"
 }
 trap cleanup EXIT INT TERM
 
@@ -32,6 +39,7 @@ check_status "/ready" "200"
 chat_code="$(curl -sS -o "$TMP_CHAT" -w "%{http_code}" \
   "$BASE_URL/v1/chat/completions" \
   -H "content-type: application/json" \
+  -H "authorization: Bearer $API_KEY" \
   -d '{
     "model": "mock-fast-v1",
     "messages": [
@@ -61,7 +69,39 @@ case "$chat_body" in
 esac
 echo "PASS /v1/chat/completions returned expected response shape"
 
-stats_code="$(curl -sS -o "$TMP_STATS" -w "%{http_code}" "$BASE_URL/stats")"
+responses_code="$(curl -sS -o "$TMP_RESPONSES" -w "%{http_code}" \
+  "$BASE_URL/v1/responses" \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $API_KEY" \
+  -d '{
+    "model": "mock-fast-v1",
+    "input": "Smoke check: answer with one sentence.",
+    "temperature": 0.2,
+    "max_output_tokens": 32
+  }')"
+
+if [ "$responses_code" != "200" ]; then
+  echo "FAIL /v1/responses returned HTTP $responses_code"
+  echo "Response:"
+  cat "$TMP_RESPONSES"
+  exit 1
+fi
+
+responses_body="$(cat "$TMP_RESPONSES")"
+case "$responses_body" in
+  *"\"object\":\"response\""* ) ;;
+  * )
+    echo "FAIL /v1/responses missing expected response object"
+    echo "Response:"
+    echo "$responses_body"
+    exit 1
+    ;;
+esac
+echo "PASS /v1/responses returned expected response shape"
+
+stats_code="$(curl -sS -o "$TMP_STATS" -w "%{http_code}" \
+  -H "authorization: Bearer $API_KEY" \
+  "$BASE_URL/stats")"
 if [ "$stats_code" != "200" ]; then
   echo "FAIL /stats returned HTTP $stats_code"
   echo "Response:"

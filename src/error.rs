@@ -1,4 +1,11 @@
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    http::{
+        header::{HeaderValue, RETRY_AFTER},
+        StatusCode,
+    },
+    response::IntoResponse,
+    Json,
+};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -10,6 +17,16 @@ pub enum AppError {
     InvalidRequest {
         message: String,
         request_id: Option<Uuid>,
+    },
+    #[error("unauthorized")]
+    Unauthorized {
+        message: String,
+        request_id: Option<Uuid>,
+    },
+    #[error("request rate limited")]
+    GatewayRateLimited {
+        request_id: Option<Uuid>,
+        retry_after_seconds: u64,
     },
     #[error("no provider available")]
     NoProviderAvailable { request_id: Option<Uuid> },
@@ -39,6 +56,8 @@ impl AppError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
+            Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            Self::GatewayRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::NoProviderAvailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::ProviderRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::ProviderTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
@@ -50,6 +69,8 @@ impl AppError {
     fn code(&self) -> &'static str {
         match self {
             Self::InvalidRequest { .. } => "invalid_request",
+            Self::Unauthorized { .. } => "unauthorized",
+            Self::GatewayRateLimited { .. } => "gateway_rate_limited",
             Self::NoProviderAvailable { .. } => "no_provider_available",
             Self::ProviderRateLimited { .. } => "provider_rate_limited",
             Self::ProviderTimeout { .. } => "provider_timeout",
@@ -61,6 +82,8 @@ impl AppError {
     fn request_id(&self) -> Option<Uuid> {
         match self {
             Self::InvalidRequest { request_id, .. }
+            | Self::Unauthorized { request_id, .. }
+            | Self::GatewayRateLimited { request_id, .. }
             | Self::NoProviderAvailable { request_id }
             | Self::ProviderRateLimited { request_id }
             | Self::ProviderTimeout { request_id }
@@ -69,9 +92,11 @@ impl AppError {
         }
     }
 
-    fn public_message(&self) -> String {
+    pub fn public_message(&self) -> String {
         match self {
             Self::InvalidRequest { message, .. } => message.clone(),
+            Self::Unauthorized { message, .. } => message.clone(),
+            Self::GatewayRateLimited { .. } => "request rate limit exceeded, retry later".into(),
             Self::NoProviderAvailable { .. } => "no provider is available for this request".into(),
             Self::ProviderRateLimited { .. } => "provider rate limited this request".into(),
             Self::ProviderTimeout { .. } => "provider timed out while handling this request".into(),
@@ -93,6 +118,13 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
+        let retry_after = match &self {
+            Self::GatewayRateLimited {
+                retry_after_seconds,
+                ..
+            } => Some(*retry_after_seconds),
+            _ => None,
+        };
         let status = self.status_code();
         let body = ErrorResponse {
             error: ErrorBody {
@@ -101,7 +133,12 @@ impl IntoResponse for AppError {
                 request_id: self.request_id(),
             },
         };
-
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(retry_after_seconds) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.max(1).to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }

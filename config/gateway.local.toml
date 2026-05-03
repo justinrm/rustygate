@@ -1,0 +1,59 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+shutdown_grace_period_ms = 10000
+
+[gateway]
+# Local profile for mock-provider development and demos.
+default_timeout_ms = 15000
+max_retries = 1
+enable_request_logging = true
+log_prompt_content = false
+api_key_env = "RUSTYGATE_GATEWAY_API_KEY"
+routing_policy = "priority"
+model_aliases = { "mock-fast" = "mock-fast-v1" }
+
+[gateway.retry]
+initial_backoff_ms = 100
+max_backoff_ms = 1000
+jitter_ms = 20
+
+[gateway.circuit_breaker]
+failure_threshold = 3
+open_duration_ms = 5000
+half_open_max_probes = 1
+
+[gateway.rate_limit]
+global_requests_per_minute = 240
+global_burst_size = 60
+per_key_requests_per_minute = 120
+per_key_burst_size = 30
+
+[gateway.request_limits]
+max_chat_body_bytes = 65536
+max_messages_per_request = 64
+max_message_content_chars = 8000
+
+[storage]
+enabled = false
+database_url = "sqlite://rustygate.db"
+
+[[providers]]
+name = "mock-low-latency"
+kind = "mock"
+model = "mock-fast-v1"
+priority = 1
+failure_rate = 0.0
+base_latency_ms = 0
+cost_per_1k_input_tokens = 0.0001
+cost_per_1k_output_tokens = 0.0002
+
+[[providers]]
+name = "mock-backup"
+kind = "mock"
+model = "mock-fast-v1"
+priority = 2
+failure_rate = 0.0
+base_latency_ms = 0
+cost_per_1k_input_tokens = 0.00008
+cost_per_1k_output_tokens = 0.00015

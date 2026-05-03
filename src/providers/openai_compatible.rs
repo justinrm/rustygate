@@ -1,16 +1,26 @@
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
+    compat::openai_id,
     models::chat::{
-        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatRole,
-        TokenUsage,
+        ChatChoice, ChatCompletionChunkResponse, ChatCompletionRequest, ChatCompletionResponse,
+        ChatDelta, ChatMessage, ChatRole, TokenUsage,
     },
-    providers::provider::{ChatProvider, ProviderError},
+    providers::{
+        provider::{
+            ChatProvider, ProviderError, ProviderStream, ProviderStreamContext, ProviderStreamEvent,
+        },
+        sse::SseDataParser,
+    },
     telemetry::token_estimator::{estimate_tokens_for_messages, estimate_tokens_for_text},
 };
+
+const MAX_STREAM_OUTPUT_CHARS: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleProvider {
@@ -27,6 +37,10 @@ impl ChatProvider for OpenAiCompatibleProvider {
         &self.name
     }
 
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn supports_model(&self, model: &str) -> bool {
         self.model == model
     }
@@ -41,6 +55,7 @@ impl ChatProvider for OpenAiCompatibleProvider {
             messages: request.messages.clone(),
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            stream: None,
         };
 
         let response = self
@@ -79,7 +94,7 @@ impl ChatProvider for OpenAiCompatibleProvider {
         });
 
         Ok(ChatCompletionResponse {
-            id: Uuid::new_v4(),
+            id: openai_id("chatcmpl", Uuid::new_v4()),
             object: "chat.completion",
             created: parsed.created.unwrap_or(1_700_000_000),
             model: parsed.model,
@@ -97,6 +112,110 @@ impl ChatProvider for OpenAiCompatibleProvider {
             usage,
         })
     }
+
+    async fn chat_completion_stream(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError> {
+        let endpoint = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let model = request.model.clone().unwrap_or_else(|| self.model.clone());
+        let created = OffsetDateTime::now_utc().unix_timestamp();
+        let response_id = Uuid::new_v4();
+        let prompt_tokens = estimate_tokens_for_messages(&request.messages);
+        let outbound_request = OpenAiChatRequest {
+            model: model.clone(),
+            messages: request.messages.clone(),
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            stream: Some(true),
+        };
+
+        let response = self
+            .client
+            .post(endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&outbound_request)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(map_http_status(status));
+        }
+
+        let provider_name = self.name.clone();
+        let model_for_stream = model.clone();
+        let stream = async_stream::try_stream! {
+            let mut parser = SseDataParser::default();
+            let mut completion_text = String::new();
+            let mut usage: Option<TokenUsage> = None;
+            let mut bytes_stream = response.bytes_stream();
+
+            while let Some(bytes) = bytes_stream.next().await {
+                let chunk = bytes.map_err(map_transport_error)?;
+                let text = std::str::from_utf8(&chunk).map_err(|_| ProviderError::ProviderBadResponse)?;
+                let events = parser.push_chunk(text)?;
+
+                for event_data in events {
+                    if event_data == "[DONE]" {
+                        let completed_usage = usage.take().unwrap_or_else(|| {
+                            let completion_tokens = estimate_tokens_for_text(&completion_text);
+                            TokenUsage {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens: prompt_tokens + completion_tokens,
+                            }
+                        });
+                        yield ProviderStreamEvent::Completed {
+                            usage: completed_usage,
+                        };
+                        return;
+                    }
+
+                    let parsed: OpenAiStreamChunk = serde_json::from_str(&event_data)
+                        .map_err(|_| ProviderError::ProviderBadResponse)?;
+                    if let Some(event_usage) = parsed.usage {
+                        usage = Some(event_usage);
+                    }
+                    let Some(first_choice) = parsed.choices.into_iter().next() else {
+                        continue;
+                    };
+                    let delta = first_choice.delta.unwrap_or_default();
+                    if let Some(content) = delta.content.as_deref() {
+                        if completion_text.chars().count() + content.chars().count() > MAX_STREAM_OUTPUT_CHARS {
+                            Err::<(), _>(ProviderError::ProviderBadResponse)?;
+                        }
+                        completion_text.push_str(content);
+                    }
+
+                    yield ProviderStreamEvent::Chunk(ChatCompletionChunkResponse::from_delta(
+                        response_id,
+                        parsed.created.unwrap_or(created),
+                        parsed.model.unwrap_or_else(|| model_for_stream.clone()),
+                        provider_name.clone(),
+                        first_choice.index,
+                        ChatDelta {
+                            role: delta.role,
+                            content: delta.content,
+                        },
+                        first_choice.finish_reason,
+                    ));
+                }
+            }
+
+            Err::<(), _>(ProviderError::ProviderBadResponse)?;
+        }
+        .boxed();
+
+        Ok((
+            ProviderStreamContext {
+                response_id,
+                created,
+                model,
+            },
+            stream,
+        ))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +226,8 @@ struct OpenAiChatRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +250,36 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiAssistantMessage {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChunk {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    choices: Vec<OpenAiStreamChoice>,
+    #[serde(default)]
+    usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChoice {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    delta: Option<OpenAiStreamDelta>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiStreamDelta {
+    #[serde(default)]
+    role: Option<ChatRole>,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 fn map_http_status(status: StatusCode) -> ProviderError {

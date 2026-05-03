@@ -1,21 +1,40 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use axum::{
     body::{to_bytes, Body},
-    http::{Request, StatusCode},
+    http::{header, Request, StatusCode},
 };
+use futures_util::StreamExt;
 use rustygate::{
     app::{self, AppState},
-    models::chat::{ChatCompletionRequest, ChatCompletionResponse},
+    models::chat::{
+        ChatCompletionChunkResponse, ChatCompletionRequest, ChatCompletionResponse, ChatDelta,
+        ChatRole,
+    },
     providers::{
         mock::MockProvider,
-        provider::{ChatProvider, ProviderEntry, ProviderError, ProviderPricing},
+        provider::{
+            ChatProvider, ProviderEntry, ProviderError, ProviderPricing, ProviderStream,
+            ProviderStreamContext, ProviderStreamEvent,
+        },
+    },
+    routing::resilience::{
+        CircuitBreakerPolicy, ProviderResiliencePolicy, ResilienceRegistry, RetryPolicy,
     },
 };
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+const TEST_GATEWAY_KEY: &str = "test-gateway-key";
 
 #[tokio::test]
 async fn chat_completion_success_uses_mock_provider() {
@@ -31,6 +50,7 @@ async fn chat_completion_success_uses_mock_provider() {
                 .uri("/v1/chat/completions")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::from(
                     json!({
                         "model": "mock-fast-v1",
@@ -52,7 +72,7 @@ async fn chat_completion_success_uses_mock_provider() {
 
     assert_eq!(json["object"], "chat.completion");
     let request_id = json["id"].as_str().unwrap();
-    Uuid::parse_str(request_id).unwrap();
+    assert!(request_id.starts_with("chatcmpl-"));
     assert_eq!(json["provider"], "mock-primary");
     assert_eq!(json["model"], "mock-fast-v1");
     assert_eq!(json["usage"]["prompt_tokens"], 2);
@@ -64,6 +84,35 @@ async fn chat_completion_success_uses_mock_provider() {
         "Deterministic mock response from mock-primary."
     );
     assert!(json.get("estimated_cost_usd").is_none());
+}
+
+#[tokio::test]
+async fn chat_completion_resolves_configured_model_alias() {
+    let mut state = AppState::from_providers(vec![ProviderEntry {
+        priority: 1,
+        provider: Arc::new(MockProvider::new("mock-primary", "mock-fast-v1")),
+        pricing: ProviderPricing::default(),
+    }]);
+    state.model_aliases = Arc::new(BTreeMap::from([(
+        "mock-fast".to_string(),
+        "mock-fast-v1".to_string(),
+    )]));
+
+    let response = app::router_with_state(state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast",
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["provider"], "mock-primary");
+    assert_eq!(json["model"], "mock-fast-v1");
 }
 
 #[tokio::test]
@@ -106,6 +155,211 @@ async fn chat_completion_uses_secondary_provider_after_retryable_primary_failure
         json["choices"][0]["message"]["content"],
         "Deterministic mock response from mock-secondary."
     );
+}
+
+#[tokio::test]
+async fn chat_completion_retries_primary_before_fallback() {
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let primary = Arc::new(AlwaysFailingCountedProvider::new(
+        "mock-primary",
+        "mock-fast-v1",
+        ProviderError::Timeout,
+        primary_calls.clone(),
+    ));
+    let mut state = AppState::from_providers(vec![
+        ProviderEntry {
+            priority: 1,
+            provider: primary,
+            pricing: ProviderPricing::default(),
+        },
+        ProviderEntry {
+            priority: 2,
+            provider: Arc::new(MockProvider::new("mock-secondary", "mock-fast-v1")),
+            pricing: ProviderPricing::default(),
+        },
+    ]);
+    let mut provider_policies = HashMap::new();
+    provider_policies.insert(
+        "mock-primary".to_string(),
+        ProviderResiliencePolicy {
+            retry: RetryPolicy {
+                max_retries: 2,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+                jitter_ms: 0,
+            },
+            breaker: CircuitBreakerPolicy {
+                failure_threshold: 10,
+                open_duration_ms: 60_000,
+                half_open_max_probes: 1,
+            },
+            ..ProviderResiliencePolicy::default()
+        },
+    );
+    state.resilience = Arc::new(ResilienceRegistry::new(
+        ProviderResiliencePolicy::default(),
+        provider_policies,
+        &state.provider_names(),
+    ));
+
+    let response = app::router_with_state(state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["provider"], "mock-secondary");
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn chat_completion_skips_open_circuit_and_reenters_after_recovery_probe() {
+    let fail_once_provider = Arc::new(FailOnceThenSucceedProvider::new(
+        "mock-primary",
+        "mock-fast-v1",
+        ProviderError::Timeout,
+    ));
+    let mut state = AppState::from_providers(vec![
+        ProviderEntry {
+            priority: 1,
+            provider: fail_once_provider.clone(),
+            pricing: ProviderPricing::default(),
+        },
+        ProviderEntry {
+            priority: 2,
+            provider: Arc::new(MockProvider::new("mock-secondary", "mock-fast-v1")),
+            pricing: ProviderPricing::default(),
+        },
+    ]);
+    let mut provider_policies = HashMap::new();
+    provider_policies.insert(
+        "mock-primary".to_string(),
+        ProviderResiliencePolicy {
+            retry: RetryPolicy {
+                max_retries: 0,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+                jitter_ms: 0,
+            },
+            breaker: CircuitBreakerPolicy {
+                failure_threshold: 1,
+                open_duration_ms: 0,
+                half_open_max_probes: 1,
+            },
+            ..ProviderResiliencePolicy::default()
+        },
+    );
+    state.resilience = Arc::new(ResilienceRegistry::new(
+        ProviderResiliencePolicy::default(),
+        provider_policies,
+        &state.provider_names(),
+    ));
+    let app = app::router_with_state(state);
+
+    let first_response = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [{"role": "user", "content": "First"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_json: Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_json["provider"], "mock-secondary");
+
+    let second_response = app
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [{"role": "user", "content": "Second"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_json: Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(second_json["provider"], "mock-primary");
+    assert_eq!(fail_once_provider.calls(), 2);
+}
+
+#[tokio::test]
+async fn chat_completion_skips_provider_while_circuit_is_open() {
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let primary = Arc::new(AlwaysFailingCountedProvider::new(
+        "mock-primary",
+        "mock-fast-v1",
+        ProviderError::Timeout,
+        primary_calls.clone(),
+    ));
+    let mut state = AppState::from_providers(vec![
+        ProviderEntry {
+            priority: 1,
+            provider: primary,
+            pricing: ProviderPricing::default(),
+        },
+        ProviderEntry {
+            priority: 2,
+            provider: Arc::new(MockProvider::new("mock-secondary", "mock-fast-v1")),
+            pricing: ProviderPricing::default(),
+        },
+    ]);
+    let mut provider_policies = HashMap::new();
+    provider_policies.insert(
+        "mock-primary".to_string(),
+        ProviderResiliencePolicy {
+            retry: RetryPolicy {
+                max_retries: 0,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+                jitter_ms: 0,
+            },
+            breaker: CircuitBreakerPolicy {
+                failure_threshold: 1,
+                open_duration_ms: 60_000,
+                half_open_max_probes: 1,
+            },
+            ..ProviderResiliencePolicy::default()
+        },
+    );
+    state.resilience = Arc::new(ResilienceRegistry::new(
+        ProviderResiliencePolicy::default(),
+        provider_policies,
+        &state.provider_names(),
+    ));
+    let app = app::router_with_state(state);
+
+    let first = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [{"role": "user", "content": "First"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+
+    let second = app
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [{"role": "user", "content": "Second"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -206,6 +460,7 @@ async fn chat_completion_stops_on_non_retryable_provider_error() {
             Request::builder()
                 .uri("/stats/providers")
                 .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -297,7 +552,7 @@ async fn chat_completion_rejects_invalid_role_with_clean_error() {
         .oneshot(chat_request(json!({
             "model": "mock-fast-v1",
             "messages": [
-                {"role": "developer", "content": "Say hi"}
+                {"role": "invalid-role", "content": "Say hi"}
             ]
         })))
         .await
@@ -323,6 +578,7 @@ async fn chat_completion_rejects_empty_messages() {
                 .uri("/v1/chat/completions")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::from(
                     json!({
                         "model": "mock-fast-v1",
@@ -379,6 +635,7 @@ async fn chat_completion_rejects_empty_message_content() {
                 .uri("/v1/chat/completions")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
                 .body(Body::from(
                     json!({
                         "model": "mock-fast-v1",
@@ -407,6 +664,113 @@ async fn chat_completion_rejects_empty_message_content() {
     Uuid::parse_str(request_id).unwrap();
 }
 
+#[tokio::test]
+async fn chat_completion_stream_returns_sse_chunks_and_done_marker() {
+    let state = AppState::from_providers(vec![ProviderEntry {
+        priority: 1,
+        provider: Arc::new(MockProvider::new("mock-primary", "mock-fast-v1")),
+        pricing: ProviderPricing::default(),
+    }]);
+
+    let response = app::router_with_state(state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body_text.contains("chat.completion.chunk"));
+    assert!(body_text.contains("mock-primary"));
+    assert!(body_text.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn chat_stream_falls_back_before_first_chunk() {
+    let state = AppState::from_providers(vec![
+        ProviderEntry {
+            priority: 1,
+            provider: Arc::new(MockProvider {
+                name: "mock-primary".into(),
+                model: "mock-fast-v1".into(),
+                failure_rate: 1.0,
+                base_latency_ms: 0,
+            }),
+            pricing: ProviderPricing::default(),
+        },
+        ProviderEntry {
+            priority: 2,
+            provider: Arc::new(MockProvider::new("mock-secondary", "mock-fast-v1")),
+            pricing: ProviderPricing::default(),
+        },
+    ]);
+
+    let response = app::router_with_state(state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body_text.contains("mock-secondary"));
+    assert!(!body_text.contains("mock-primary"));
+}
+
+#[tokio::test]
+async fn chat_stream_emits_error_event_after_partial_output() {
+    let state = AppState::from_providers(vec![ProviderEntry {
+        priority: 1,
+        provider: Arc::new(MidstreamFailingProvider::new(
+            "midstream-fail",
+            "mock-fast-v1",
+            ProviderError::Timeout,
+        )),
+        pricing: ProviderPricing::default(),
+    }]);
+
+    let response = app::router_with_state(state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body_text.contains("chat.completion.chunk"));
+    assert!(body_text.contains("\"error\""));
+    assert!(body_text.contains("provider timed out while handling this request"));
+    assert_eq!(body_text.matches("\"provider\"").count(), 1);
+    assert!(!body_text.contains("[DONE]"));
+}
+
 fn chat_request(body: Value) -> Request<Body> {
     chat_request_raw(body.to_string())
 }
@@ -416,6 +780,7 @@ fn chat_request_raw(body: impl Into<String>) -> Request<Body> {
         .uri("/v1/chat/completions")
         .method("POST")
         .header("content-type", "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
         .body(Body::from(body.into()))
         .unwrap()
 }
@@ -445,6 +810,10 @@ impl ChatProvider for FailingProvider {
         &self.name
     }
 
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn supports_model(&self, model: &str) -> bool {
         self.model == model
     }
@@ -454,5 +823,199 @@ impl ChatProvider for FailingProvider {
         _request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         Err(self.error.clone())
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError> {
+        Err(self.error.clone())
+    }
+}
+
+#[derive(Debug)]
+struct MidstreamFailingProvider {
+    name: String,
+    model: String,
+    error: ProviderError,
+}
+
+#[derive(Debug)]
+struct AlwaysFailingCountedProvider {
+    name: String,
+    model: String,
+    error: ProviderError,
+    calls: Arc<AtomicUsize>,
+}
+
+impl AlwaysFailingCountedProvider {
+    fn new(name: &str, model: &str, error: ProviderError, calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            name: name.to_string(),
+            model: model.to_string(),
+            error,
+            calls,
+        }
+    }
+}
+
+#[async_trait]
+impl ChatProvider for AlwaysFailingCountedProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn supports_model(&self, model: &str) -> bool {
+        self.model == model
+    }
+
+    async fn chat_completion(
+        &self,
+        _request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(self.error.clone())
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(self.error.clone())
+    }
+}
+
+#[derive(Debug)]
+struct FailOnceThenSucceedProvider {
+    name: String,
+    model: String,
+    first_error: ProviderError,
+    calls: AtomicUsize,
+}
+
+impl FailOnceThenSucceedProvider {
+    fn new(name: &str, model: &str, first_error: ProviderError) -> Self {
+        Self {
+            name: name.to_string(),
+            model: model.to_string(),
+            first_error,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ChatProvider for FailOnceThenSucceedProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn supports_model(&self, model: &str) -> bool {
+        self.model == model
+    }
+
+    async fn chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        let current = self.calls.fetch_add(1, Ordering::SeqCst);
+        if current == 0 {
+            return Err(self.first_error.clone());
+        }
+
+        Ok(ChatCompletionResponse::placeholder(
+            Uuid::new_v4(),
+            request.model.unwrap_or_else(|| self.model.clone()),
+            self.name.clone(),
+        ))
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError> {
+        Err(ProviderError::ProviderBadResponse)
+    }
+}
+
+impl MidstreamFailingProvider {
+    fn new(name: &str, model: &str, error: ProviderError) -> Self {
+        Self {
+            name: name.to_string(),
+            model: model.to_string(),
+            error,
+        }
+    }
+}
+
+#[async_trait]
+impl ChatProvider for MidstreamFailingProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn supports_model(&self, model: &str) -> bool {
+        self.model == model
+    }
+
+    async fn chat_completion(
+        &self,
+        _request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Err(self.error.clone())
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError> {
+        let model = request.model.unwrap_or_else(|| self.model.clone());
+        let model_for_stream = model.clone();
+        let response_id = Uuid::new_v4();
+        let created = OffsetDateTime::now_utc().unix_timestamp();
+        let provider_name = self.name.clone();
+        let error = self.error.clone();
+        let stream = async_stream::try_stream! {
+            yield ProviderStreamEvent::Chunk(ChatCompletionChunkResponse::from_delta(
+                response_id,
+                created,
+                model_for_stream.clone(),
+                provider_name,
+                0,
+                ChatDelta {
+                    role: Some(ChatRole::Assistant),
+                    content: Some("partial ".to_string()),
+                },
+                None,
+            ));
+            Err::<(), _>(error)?;
+        }
+        .boxed();
+
+        Ok((
+            ProviderStreamContext {
+                response_id,
+                created,
+                model,
+            },
+            stream,
+        ))
     }
 }

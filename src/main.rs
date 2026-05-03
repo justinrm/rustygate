@@ -1,6 +1,6 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
-use rustygate::{app, config::AppConfig};
+use rustygate::{app, config::AppConfig, server};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -12,6 +12,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
     let addr = SocketAddr::new(config.server.host, config.server.port);
+    let shutdown_grace_period = Duration::from_millis(config.server.shutdown_grace_period_ms);
     let request_logging_enabled = config.gateway.enable_request_logging;
     let prompt_logging_enabled = config.gateway.log_prompt_content;
     let storage_enabled = config.storage.enabled;
@@ -31,12 +32,29 @@ async fn main() -> anyhow::Result<()> {
         request_logging_enabled,
         prompt_logging_enabled,
         storage_enabled,
+        shutdown_grace_period_ms = shutdown_grace_period.as_millis(),
         "starting RustyGate"
     );
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .map_err(anyhow::Error::from)
+    };
+
+    server::run_with_graceful_shutdown(
+        server,
+        server::shutdown_signal(),
+        shutdown_grace_period,
+        move || {
+            let _ = shutdown_tx.send(());
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -49,8 +67,4 @@ fn init_tracing() {
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
 }

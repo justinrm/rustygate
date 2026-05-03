@@ -1,18 +1,27 @@
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
+    compat::openai_id,
     models::chat::{
-        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatRole,
-        TokenUsage,
+        ChatChoice, ChatCompletionChunkResponse, ChatCompletionRequest, ChatCompletionResponse,
+        ChatDelta, ChatMessage, ChatRole, TokenUsage,
     },
-    providers::provider::{ChatProvider, ProviderError},
+    providers::{
+        provider::{
+            ChatProvider, ProviderError, ProviderStream, ProviderStreamContext, ProviderStreamEvent,
+        },
+        sse::SseDataParser,
+    },
     telemetry::token_estimator::{estimate_tokens_for_messages, estimate_tokens_for_text},
 };
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+const MAX_STREAM_OUTPUT_CHARS: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -27,6 +36,10 @@ pub struct AnthropicProvider {
 impl ChatProvider for AnthropicProvider {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     fn supports_model(&self, model: &str) -> bool {
@@ -45,6 +58,7 @@ impl ChatProvider for AnthropicProvider {
             messages,
             system,
             temperature: request.temperature,
+            stream: None,
         };
 
         let response = self
@@ -83,7 +97,7 @@ impl ChatProvider for AnthropicProvider {
         });
 
         Ok(ChatCompletionResponse {
-            id: Uuid::new_v4(),
+            id: openai_id("chatcmpl", Uuid::new_v4()),
             object: "chat.completion",
             created: 1_700_000_000,
             model: parsed.model,
@@ -99,6 +113,145 @@ impl ChatProvider for AnthropicProvider {
             usage,
         })
     }
+
+    async fn chat_completion_stream(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError> {
+        let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let (system, messages) = split_system_messages(request.messages.clone());
+        let model = request.model.clone().unwrap_or_else(|| self.model.clone());
+        let created = OffsetDateTime::now_utc().unix_timestamp();
+        let response_id = Uuid::new_v4();
+        let outbound_request = AnthropicMessagesRequest {
+            model: model.clone(),
+            max_tokens: request.max_tokens.unwrap_or(512),
+            messages,
+            system,
+            temperature: request.temperature,
+            stream: Some(true),
+        };
+
+        let response = self
+            .client
+            .post(endpoint)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
+            .json(&outbound_request)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(map_http_status(status));
+        }
+
+        let provider_name = self.name.clone();
+        let model_for_stream = model.clone();
+        let stream = async_stream::try_stream! {
+            let mut parser = SseDataParser::default();
+            let mut bytes_stream = response.bytes_stream();
+            let mut completion_text = String::new();
+            let mut prompt_tokens = estimate_tokens_for_messages(&request.messages);
+            let mut completion_tokens: Option<u32> = None;
+            let mut emitted_role = false;
+
+            while let Some(bytes) = bytes_stream.next().await {
+                let chunk = bytes.map_err(map_transport_error)?;
+                let text = std::str::from_utf8(&chunk).map_err(|_| ProviderError::ProviderBadResponse)?;
+                let events = parser.push_chunk(text)?;
+
+                for event_data in events {
+                    let parsed: AnthropicStreamEvent = serde_json::from_str(&event_data)
+                        .map_err(|_| ProviderError::ProviderBadResponse)?;
+
+                    match parsed.kind.as_str() {
+                        "message_start" => {
+                            if let Some(message) = parsed.message {
+                                if let Some(message_usage) = message.usage {
+                                    prompt_tokens = message_usage.input_tokens;
+                                }
+                            }
+                        }
+                        "content_block_delta" => {
+                            let Some(delta) = parsed.delta else {
+                                continue;
+                            };
+                            if delta.kind != "text_delta" {
+                                continue;
+                            }
+                            let Some(content) = delta.text else {
+                                continue;
+                            };
+                            if completion_text.chars().count() + content.chars().count() > MAX_STREAM_OUTPUT_CHARS {
+                                Err::<(), _>(ProviderError::ProviderBadResponse)?;
+                            }
+                            completion_text.push_str(&content);
+                            yield ProviderStreamEvent::Chunk(ChatCompletionChunkResponse::from_delta(
+                                response_id,
+                                created,
+                                model_for_stream.clone(),
+                                provider_name.clone(),
+                                0,
+                                ChatDelta {
+                                    role: if emitted_role {
+                                        None
+                                    } else {
+                                        emitted_role = true;
+                                        Some(ChatRole::Assistant)
+                                    },
+                                    content: Some(content),
+                                },
+                                None,
+                            ));
+                        }
+                        "message_delta" => {
+                            if let Some(event_usage) = parsed.usage {
+                                completion_tokens = Some(event_usage.output_tokens);
+                            }
+                            let finish_reason = parsed.delta.and_then(|delta| delta.stop_reason);
+                            if finish_reason.is_some() {
+                                yield ProviderStreamEvent::Chunk(ChatCompletionChunkResponse::from_delta(
+                                    response_id,
+                                    created,
+                                    model_for_stream.clone(),
+                                    provider_name.clone(),
+                                    0,
+                                    ChatDelta::default(),
+                                    finish_reason,
+                                ));
+                            }
+                        }
+                        "message_stop" => {
+                            let completion_tokens = completion_tokens
+                                .unwrap_or_else(|| estimate_tokens_for_text(&completion_text));
+                            yield ProviderStreamEvent::Completed {
+                                usage: TokenUsage {
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens: prompt_tokens + completion_tokens,
+                                },
+                            };
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            Err::<(), _>(ProviderError::ProviderBadResponse)?;
+        }
+        .boxed();
+
+        Ok((
+            ProviderStreamContext {
+                response_id,
+                created,
+                model,
+            },
+            stream,
+        ))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +263,8 @@ struct AnthropicMessagesRequest {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,19 +308,53 @@ impl From<AnthropicUsage> for TokenUsage {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    message: Option<AnthropicStreamMessage>,
+    #[serde(default)]
+    delta: Option<AnthropicStreamDelta>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamMessage {
+    #[allow(dead_code)]
+    model: String,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamDelta {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
 fn split_system_messages(messages: Vec<ChatMessage>) -> (Option<String>, Vec<AnthropicMessage>) {
     let mut system_messages = Vec::new();
     let mut converted = Vec::new();
 
     for message in messages {
         match message.role {
-            ChatRole::System => system_messages.push(message.content),
+            ChatRole::Developer | ChatRole::System => system_messages.push(message.content),
             ChatRole::User => converted.push(AnthropicMessage {
                 role: "user",
                 content: message.content,
             }),
             ChatRole::Assistant => converted.push(AnthropicMessage {
                 role: "assistant",
+                content: message.content,
+            }),
+            ChatRole::Tool => converted.push(AnthropicMessage {
+                role: "user",
                 content: message.content,
             }),
         }

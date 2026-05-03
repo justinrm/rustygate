@@ -137,6 +137,7 @@ impl SqliteRequestLogStore {
             SELECT
                 status,
                 latency_ms,
+                error_category,
                 COALESCE(prompt_tokens, 0) AS prompt_tokens,
                 COALESCE(completion_tokens, 0) AS completion_tokens,
                 COALESCE(total_tokens, 0) AS total_tokens,
@@ -150,7 +151,7 @@ impl SqliteRequestLogStore {
         .await?;
         let attempt_rows = sqlx::query(
             r#"
-            SELECT provider_name, success, is_fallback, latency_ms
+            SELECT provider_name, success, is_fallback, error_category, latency_ms
             FROM provider_attempts
             "#,
         )
@@ -167,6 +168,12 @@ impl SqliteRequestLogStore {
             match row.get::<String, _>("status").as_str() {
                 "success" => snapshot.successful_requests += 1,
                 _ => snapshot.failed_requests += 1,
+            }
+            if let Some(error_category) = row.get::<Option<String>, _>("error_category") {
+                *snapshot
+                    .request_errors_by_category
+                    .entry(error_category)
+                    .or_default() += 1;
             }
 
             let latency_ms = row.get::<i64, _>("latency_ms") as u64;
@@ -215,6 +222,14 @@ impl SqliteRequestLogStore {
                     .errors_by_provider
                     .entry(provider_name.clone())
                     .or_default() += 1;
+                if let Some(error_category) = row.get::<Option<String>, _>("error_category") {
+                    *snapshot
+                        .provider_errors_by_provider_and_category
+                        .entry(provider_name.clone())
+                        .or_default()
+                        .entry(error_category)
+                        .or_default() += 1;
+                }
             }
 
             if is_fallback {

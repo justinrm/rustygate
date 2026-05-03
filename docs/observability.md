@@ -2,7 +2,7 @@
 
 RustyGate should make gateway behavior easy to understand during local development without exposing secrets or prompt content.
 
-## Structured Logging Plan
+## Structured Logging
 
 RustyGate emits startup logs, HTTP tracing, and structured chat request metadata without prompt bodies by default. Request metadata logs use `tracing` fields for:
 
@@ -28,13 +28,18 @@ Generate one request ID for each inbound request. It appears in successful chat 
 
 ## Metrics Collected
 
-The MVP metrics set should include:
+RustyGate exposes JSON aggregates through `/stats` and `/stats/providers`, and Prometheus-compatible text through `/metrics`.
+
+The metrics set includes:
 
 - `total_requests`
 - `successful_requests`
 - `failed_requests`
+- `in_flight_requests`
 - `total_provider_attempts`
 - `fallback_attempts`
+- `request_errors_by_category`
+- `provider_errors_by_provider_and_category`
 - `error_rate`
 - `avg_latency_ms`
 - `p95_latency_ms`
@@ -50,6 +55,43 @@ The MVP metrics set should include:
 - `estimated_output_cost_usd`
 - `estimated_total_tokens`
 - `estimated_total_cost_usd`
+
+Prometheus metric names use the `rustygate_` prefix, including:
+
+- `rustygate_requests_total`
+- `rustygate_requests_failed_total`
+- `rustygate_in_flight_requests`
+- `rustygate_request_errors_total{category="..."}`
+- `rustygate_provider_errors_total{provider="...",category="..."}`
+- `rustygate_request_latency_ms_p95`
+- `rustygate_provider_latency_ms_p95{provider="..."}`
+
+Example scrape:
+
+```sh
+curl -H "authorization: Bearer ${RUSTYGATE_GATEWAY_API_KEY}" \
+  http://127.0.0.1:8080/metrics
+```
+
+When SQLite persistence is enabled, counters and latency aggregates come from persisted request logs where possible. Live gauges such as `rustygate_in_flight_requests` always come from in-memory process state.
+
+## Dashboard And Alert Starting Points
+
+Recommended dashboard panels:
+
+- Request volume, success count, failure count, and error rate.
+- In-flight requests.
+- Request average and p95 latency.
+- Provider attempts, provider errors, and fallback attempts by provider.
+- Provider p95 latency by provider.
+- Timeout and rate-limit counters by provider.
+
+Suggested initial alert thresholds for an internal demo deployment:
+
+- Error rate above 5% for 5 minutes.
+- Any provider timeout or rate-limit counter increasing quickly for 5 minutes.
+- Request p95 latency above the expected upstream timeout budget for 5 minutes.
+- Fallback attempts increasing while primary provider errors increase.
 
 ## Prompt Logging Policy
 
@@ -71,9 +113,8 @@ Provider stats should help answer:
 
 ## Future Ideas
 
-Do not add these during the MVP unless explicitly requested:
+Do not add these unless they are part of an explicit post-`v0.1` roadmap:
 
-- Prometheus exporter
 - OpenTelemetry traces
 - Distributed tracing
 - External log sinks

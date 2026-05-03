@@ -1,10 +1,11 @@
+use futures_util::StreamExt;
 use reqwest::Client;
 use rustygate::{
     models::chat::{ChatCompletionRequest, ChatMessage, ChatRole},
     providers::{
         anthropic::AnthropicProvider,
         openai_compatible::OpenAiCompatibleProvider,
-        provider::{ChatProvider, ProviderError},
+        provider::{ChatProvider, ProviderError, ProviderStreamEvent},
     },
 };
 use serde_json::json;
@@ -22,6 +23,7 @@ fn request(model: &str) -> ChatCompletionRequest {
         }],
         temperature: Some(0.2),
         max_tokens: Some(64),
+        stream: None,
     }
 }
 
@@ -150,4 +152,151 @@ async fn anthropic_provider_maps_auth_failure() {
         .expect_err("provider should map auth response to provider error");
 
     assert!(matches!(error, ProviderError::AuthenticationFailed));
+}
+
+#[tokio::test]
+async fn openai_provider_streams_incremental_chunks() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"id\":\"chatcmpl_123\",\"created\":1710000000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello \"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_123\",\"created\":1710000000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider {
+        name: "openai-primary".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        base_url: server.uri(),
+        api_key: "test-key".to_string(),
+        client: Client::new(),
+    };
+
+    let (_context, mut stream) = provider
+        .chat_completion_stream(ChatCompletionRequest {
+            stream: Some(true),
+            ..request("gpt-4o-mini")
+        })
+        .await
+        .expect("stream should start");
+
+    let mut chunks = Vec::new();
+    let mut usage_total = 0;
+    while let Some(event) = stream.next().await {
+        match event.expect("stream event should parse") {
+            ProviderStreamEvent::Chunk(chunk) => chunks.push(chunk),
+            ProviderStreamEvent::Completed { usage } => {
+                usage_total = usage.total_tokens;
+            }
+        }
+    }
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(
+        chunks[0].choices[0].delta.content.as_deref(),
+        Some("Hello ")
+    );
+    assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("world"));
+    assert_eq!(usage_total, 5);
+}
+
+#[tokio::test]
+async fn openai_provider_rejects_oversized_sse_events() {
+    let server = MockServer::start().await;
+    let body = format!("data: {}\n\n", "x".repeat(300 * 1024));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider {
+        name: "openai-primary".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        base_url: server.uri(),
+        api_key: "test-key".to_string(),
+        client: Client::new(),
+    };
+
+    let (_context, mut stream) = provider
+        .chat_completion_stream(ChatCompletionRequest {
+            stream: Some(true),
+            ..request("gpt-4o-mini")
+        })
+        .await
+        .expect("stream should start");
+    let error = stream
+        .next()
+        .await
+        .expect("stream should emit an error")
+        .expect_err("oversized event should be rejected");
+
+    assert!(matches!(error, ProviderError::ProviderBadResponse));
+}
+
+#[tokio::test]
+async fn anthropic_provider_streams_incremental_chunks() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-3-5-sonnet-latest\",\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"from Anthropic\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"type\":\"message_delta\",\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":8,\"output_tokens\":2}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider {
+        name: "anthropic-primary".to_string(),
+        model: "claude-3-5-sonnet-latest".to_string(),
+        base_url: server.uri(),
+        api_key: "anthropic-key".to_string(),
+        client: Client::new(),
+    };
+
+    let (_context, mut stream) = provider
+        .chat_completion_stream(ChatCompletionRequest {
+            stream: Some(true),
+            ..request("claude-3-5-sonnet-latest")
+        })
+        .await
+        .expect("stream should start");
+
+    let mut text = String::new();
+    let mut usage_total = 0;
+    while let Some(event) = stream.next().await {
+        match event.expect("stream event should parse") {
+            ProviderStreamEvent::Chunk(chunk) => {
+                if let Some(content) = chunk.choices[0].delta.content.as_deref() {
+                    text.push_str(content);
+                }
+            }
+            ProviderStreamEvent::Completed { usage } => {
+                usage_total = usage.total_tokens;
+            }
+        }
+    }
+
+    assert_eq!(text, "Hello from Anthropic");
+    assert_eq!(usage_total, 10);
 }

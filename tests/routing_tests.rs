@@ -1,14 +1,16 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use rustygate::{
+    config::RoutingPolicy,
     providers::{
         mock::MockProvider,
         provider::{ChatProvider, ProviderEntry, ProviderError, ProviderPricing},
     },
     routing::{
         fallback::{fallback_decision, RetryDecision},
-        strategy::{candidate_providers, select_provider},
+        strategy::{candidate_providers, resolve_model_alias, select_provider},
     },
+    telemetry::metrics::MetricsSnapshot,
 };
 
 fn provider_entry(name: &str, model: &str, priority: u32) -> ProviderEntry {
@@ -78,7 +80,12 @@ fn candidate_providers_returns_all_supported_providers_by_priority() {
         provider_entry("mock-secondary", "mock-fast-v1", 2),
     ];
 
-    let selected = candidate_providers(&providers, Some("mock-fast-v1"));
+    let selected = candidate_providers(
+        &providers,
+        Some("mock-fast-v1"),
+        RoutingPolicy::Priority,
+        None,
+    );
     let selected_names = selected
         .iter()
         .map(|entry| entry.provider.name())
@@ -88,6 +95,76 @@ fn candidate_providers_returns_all_supported_providers_by_priority() {
         selected_names,
         vec!["mock-primary", "mock-secondary", "mock-tertiary"]
     );
+}
+
+#[test]
+fn resolve_model_alias_maps_public_model_to_provider_model() {
+    let mut aliases = BTreeMap::new();
+    aliases.insert("gpt-4o".to_string(), "gpt-4o-mini".to_string());
+
+    assert_eq!(resolve_model_alias(&aliases, "gpt-4o"), "gpt-4o-mini");
+    assert_eq!(
+        resolve_model_alias(&aliases, "mock-fast-v1"),
+        "mock-fast-v1"
+    );
+}
+
+#[test]
+fn candidate_providers_can_order_by_lowest_cost() {
+    let providers = vec![
+        ProviderEntry {
+            priority: 1,
+            provider: Arc::new(MockProvider::new("mock-expensive", "mock-fast-v1")),
+            pricing: ProviderPricing {
+                cost_per_1k_input_tokens: 1.0,
+                cost_per_1k_output_tokens: 1.0,
+            },
+        },
+        ProviderEntry {
+            priority: 2,
+            provider: Arc::new(MockProvider::new("mock-cheap", "mock-fast-v1")),
+            pricing: ProviderPricing {
+                cost_per_1k_input_tokens: 0.1,
+                cost_per_1k_output_tokens: 0.2,
+            },
+        },
+    ];
+
+    let selected = candidate_providers(&providers, Some("mock-fast-v1"), RoutingPolicy::Cost, None);
+    let selected_names = selected
+        .iter()
+        .map(|entry| entry.provider.name())
+        .collect::<Vec<_>>();
+
+    assert_eq!(selected_names, vec!["mock-cheap", "mock-expensive"]);
+}
+
+#[test]
+fn candidate_providers_can_order_by_recent_latency() {
+    let providers = vec![
+        provider_entry("mock-slow", "mock-fast-v1", 1),
+        provider_entry("mock-fast", "mock-fast-v1", 2),
+    ];
+    let mut snapshot = MetricsSnapshot::default();
+    snapshot
+        .avg_latency_ms_by_provider
+        .insert("mock-slow".into(), 100.0);
+    snapshot
+        .avg_latency_ms_by_provider
+        .insert("mock-fast".into(), 10.0);
+
+    let selected = candidate_providers(
+        &providers,
+        Some("mock-fast-v1"),
+        RoutingPolicy::Latency,
+        Some(&snapshot),
+    );
+    let selected_names = selected
+        .iter()
+        .map(|entry| entry.provider.name())
+        .collect::<Vec<_>>();
+
+    assert_eq!(selected_names, vec!["mock-fast", "mock-slow"]);
 }
 
 #[test]

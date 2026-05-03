@@ -4,9 +4,9 @@ RustyGate is a lightweight Rust LLM inference gateway portfolio project. Keep th
 
 ## Project Purpose
 
-RustyGate demonstrates practical AI infrastructure patterns: async Rust web services, simplified OpenAI-compatible chat APIs, provider abstraction, request routing, fallback behavior, structured logging, cost estimation, and metrics.
+RustyGate demonstrates practical AI infrastructure patterns: async Rust web services, simplified OpenAI-compatible chat APIs, provider abstraction, request routing, fallback behavior, streaming responses, structured logging, cost estimation, and metrics.
 
-This is not a production inference gateway. Do not add heavy infrastructure unless explicitly requested.
+This is a lightweight internal/demo gateway, not a full production inference platform. Do not add heavy infrastructure unless explicitly requested.
 
 ## Tech Stack
 
@@ -20,17 +20,19 @@ This is not a production inference gateway. Do not add heavy infrastructure unle
 
 Add `reqwest`, `sqlx`, or `clap` only when their feature area is actively implemented.
 
-## MVP Boundaries
+## Scope Boundaries
 
-Build toward:
+Core implemented surface:
 
 - `GET /health`
 - `GET /ready`
 - `POST /v1/chat/completions`
+- `GET /v1/models`
 - `GET /stats`
 - `GET /stats/providers`
+- `GET /metrics`
 
-Use mock providers first. Do not implement streaming, Kubernetes manifests, multi-user billing, complex authentication, Redis, semantic caching, a web dashboard, or production policy engines during the MVP.
+The MVP and post-MVP hardening are complete. Keep future work focused on validation, bugs, docs, and small hardening unless a new roadmap is explicitly opened. Do not add Kubernetes manifests, multi-user billing, complex authentication, Redis, semantic caching, a web dashboard, production policy engines, or full OpenAI API compatibility without explicit approval.
 
 ## Coding Standards
 
