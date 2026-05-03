@@ -75,3 +75,31 @@ cargo fmt
 cargo clippy --all-targets --all-features
 cargo test
 ```
+
+## Cursor Cloud specific instructions
+
+### Running the service
+
+1. Ensure `.env` exists (copy from `.env.example` if missing — it sets `RUSTYGATE_GATEWAY_API_KEY=local-dev-gateway-key` and uses mock providers).
+2. Start with `cargo run`. The server listens on `127.0.0.1:8080`.
+3. No external services are required — the default `config/gateway.local.toml` uses only in-process mock providers.
+
+### Testing endpoints
+
+All protected endpoints require `Authorization: Bearer local-dev-gateway-key` (the value from `.env`).
+
+```sh
+curl http://127.0.0.1:8080/health
+curl -H "Authorization: Bearer local-dev-gateway-key" http://127.0.0.1:8080/v1/models
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer local-dev-gateway-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mock-fast","messages":[{"role":"user","content":"test"}]}'
+```
+
+### Notes
+
+- The `rust-toolchain.toml` pins `channel = "stable"`; rustup auto-installs it.
+- SQLite storage is disabled by default (`storage.enabled = false` in local config). No DB setup needed.
+- Real provider API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) are only needed for staging/prod config profiles — never for local development or tests.
+- All 89 tests (unit + integration) run without network access or external dependencies.
