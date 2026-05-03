@@ -1002,6 +1002,7 @@ impl ChatProvider for MidstreamFailingProvider {
                 ChatDelta {
                     role: Some(ChatRole::Assistant),
                     content: Some("partial ".to_string()),
+                    tool_calls: None,
                 },
                 None,
             ));

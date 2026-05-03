@@ -53,6 +53,14 @@ impl ChatProvider for MockProvider {
         self.model == model
     }
 
+    async fn health_check(&self) -> Result<(), ProviderError> {
+        if self.failure_rate >= 1.0 {
+            Err(ProviderError::ProviderUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,
@@ -62,7 +70,26 @@ impl ChatProvider for MockProvider {
         }
 
         let model = request.model.unwrap_or_else(|| self.model.clone());
-        let response_content = format!("Deterministic mock response from {}.", self.name);
+        let tool_calls = request.tools.as_ref().and_then(|tools| {
+            tools.first().map(|tool| {
+                vec![crate::models::chat::ToolCall {
+                    id: openai_id("call", response_id_seed(&self.name, &tool.function.name)),
+                    kind: "function".into(),
+                    function: crate::models::chat::ToolCallFunction {
+                        name: tool.function.name.clone(),
+                        arguments: serde_json::json!({
+                            "echo": request.messages.last().map(|message| message.content.as_str()).unwrap_or("")
+                        })
+                        .to_string(),
+                    },
+                }]
+            })
+        });
+        let response_content = if tool_calls.is_some() {
+            String::new()
+        } else {
+            format!("Deterministic mock response from {}.", self.name)
+        };
         let prompt_tokens = estimate_tokens_for_messages(&request.messages);
         let completion_tokens = estimate_tokens_for_text(&response_content);
         let seed = format!(
@@ -73,7 +100,7 @@ impl ChatProvider for MockProvider {
 
         Ok(ChatCompletionResponse {
             id: openai_id("chatcmpl", response_id),
-            object: "chat.completion",
+            object: "chat.completion".into(),
             created: 1_700_000_000,
             model,
             provider: self.name.clone(),
@@ -82,6 +109,8 @@ impl ChatProvider for MockProvider {
                 message: ChatMessage {
                     role: ChatRole::Assistant,
                     content: response_content,
+                    tool_calls,
+                    tool_call_id: None,
                 },
                 finish_reason: "stop".into(),
             }],
@@ -134,6 +163,7 @@ impl ChatProvider for MockProvider {
                             None
                         },
                         content: Some(content),
+                        tool_calls: None,
                     },
                     None,
                 ));
@@ -171,4 +201,8 @@ fn deterministic_uuid(seed: &str) -> Uuid {
     }
 
     Uuid::from_bytes(bytes)
+}
+
+fn response_id_seed(provider: &str, tool_name: &str) -> Uuid {
+    deterministic_uuid(&format!("{provider}|tool|{tool_name}"))
 }

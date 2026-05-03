@@ -26,6 +26,14 @@ Implemented now:
 - Structured JSON errors with request IDs
 - Startup, HTTP tracing, and structured request metadata logs
 - Optional SQLite persistence for request logs and provider attempts
+- OpenTelemetry trace export with provider-attempt spans and trace-context propagation
+- Provider health probes feeding `/ready?detail=true`
+- SQLite-backed multi-key auth with hashed keys, roles, quotas, and `rustygate_admin`
+- Bounded local rate-limit state plus optional Redis-backed rate limiting behind `redis-backend`
+- OpenAI-compatible tool/function calling for mock, OpenAI-compatible, and Anthropic paths
+- Opt-in exact-match response caching with cache hit/miss metrics
+- Experimental semantic cache primitives behind `semantic-cache`
+- Reproducible benchmark harness under `benchmarks/`
 - Config loading from TOML (`RUSTYGATE_CONFIG` override supported)
 
 Release notes: `docs/releases/v0.2.0.md`
@@ -34,13 +42,15 @@ Operations runbook: `docs/operations.md`
 
 OpenAI compatibility matrix: `docs/openai-compatibility.md`
 
-## Non-Goals (MVP)
+## Non-Goals
 
-No Kubernetes manifests, multi-user billing, complex auth, Redis, web dashboard, semantic caching, or production policy engines.
+No Kubernetes manifests, multi-user billing, web dashboard, or production policy engines. Redis and semantic caching exist only as optional portfolio-hardening features and remain off by default.
 
 ## Known Limitations
 
 - Circuit breaker failure tracking is consecutive-failure based and in-memory only.
+- The semantic cache is experimental and should be enabled only for demos or controlled tests.
+- Benchmarks use mock upstream behavior and measure gateway overhead, not real LLM latency.
 
 ## Quickstart
 
@@ -76,6 +86,13 @@ export RUSTYGATE_GATEWAY_API_KEY=local-dev-gateway-key
 export OPENAI_API_KEY=...
 export ANTHROPIC_API_KEY=...
 cargo run
+```
+
+Manage SQLite-backed API keys when `[storage].enabled = true`:
+
+```sh
+cargo run --bin rustygate_admin -- keys create --label local-dev --role admin
+cargo run --bin rustygate_admin -- keys list
 ```
 
 Verify endpoints:

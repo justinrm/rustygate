@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod anthropic_tool_translation;
 pub mod mock;
 pub mod openai_compatible;
 pub mod provider;

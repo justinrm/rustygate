@@ -1,22 +1,39 @@
 use std::{net::SocketAddr, time::Duration};
 
-use rustygate::{app, config::AppConfig, server};
+use rustygate::{app, config::AppConfig, server, telemetry};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    init_tracing();
 
     let config = AppConfig::from_env()?;
+    telemetry::tracing::init_tracing(&config.telemetry)?;
     let addr = SocketAddr::new(config.server.host, config.server.port);
     let shutdown_grace_period = Duration::from_millis(config.server.shutdown_grace_period_ms);
     let request_logging_enabled = config.gateway.enable_request_logging;
     let prompt_logging_enabled = config.gateway.log_prompt_content;
     let storage_enabled = config.storage.enabled;
     let state = app::AppState::from_config(&config).await?;
+    rustygate::routing::health::spawn_provider_health_probes(
+        state.clone(),
+        Duration::from_millis(config.gateway.health_check_interval_ms),
+    );
+    if let Some(store) = state.request_log_store.clone() {
+        let retention_days = config.storage.retention_days;
+        tokio::spawn(async move {
+            let interval = Duration::from_secs(86_400);
+            loop {
+                let cutoff =
+                    current_unix_seconds().saturating_sub(retention_days.saturating_mul(86_400));
+                if let Err(error) = store.prune_older_than(cutoff).await {
+                    warn!(error = %error, "failed to prune retained SQLite telemetry rows");
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
     let provider_names = state.provider_names();
     let provider_count = provider_names.len();
     let app = app::router_with_state(state).layer(TraceLayer::new_for_http());
@@ -59,12 +76,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("rustygate=info,tower_http=info"));
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+fn current_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }

@@ -100,6 +100,10 @@ pub trait ChatProvider: Send + Sync {
 
     fn supports_model(&self, model: &str) -> bool;
 
+    async fn health_check(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,

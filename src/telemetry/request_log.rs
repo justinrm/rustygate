@@ -247,10 +247,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "secret prompt".into(),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             temperature: None,
             max_tokens: None,
             stream: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            response_format: None,
         }
     }
 }

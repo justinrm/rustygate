@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use tokio::time::sleep;
+use tracing::{field, Instrument};
 
 use crate::{
     config::RoutingPolicy,
@@ -114,13 +115,37 @@ pub async fn complete_chat(
         let mut last_retryable_error = None;
 
         for retry_attempt in 0..=retry_policy.max_retries {
+            let next_attempt_order = attempt_order.saturating_add(1);
+            let attempt_span = tracing::info_span!(
+                "provider_attempt",
+                "gen_ai.system" = "llm_provider",
+                "gen_ai.request.model" = request.model.as_deref().unwrap_or("unknown"),
+                "rustygate.provider.name" = provider_name.as_str(),
+                "rustygate.attempt.order" = next_attempt_order,
+                "rustygate.attempt.retry" = retry_attempt,
+                "rustygate.attempt.is_fallback" = is_fallback,
+                "gen_ai.usage.input_tokens" = field::Empty,
+                "gen_ai.usage.output_tokens" = field::Empty,
+                "rustygate.attempt.latency_ms" = field::Empty,
+                "error.type" = field::Empty,
+            );
             let started = Instant::now();
-            let result = entry.provider.chat_completion(request.clone()).await;
+            let result = entry
+                .provider
+                .chat_completion(request.clone())
+                .instrument(attempt_span.clone())
+                .await;
             let latency_ms = started.elapsed().as_millis() as u64;
-            attempt_order = attempt_order.saturating_add(1);
+            attempt_order = next_attempt_order;
+            attempt_span.record("rustygate.attempt.latency_ms", latency_ms);
 
             match result {
                 Ok(response) => {
+                    attempt_span.record("gen_ai.usage.input_tokens", response.usage.prompt_tokens);
+                    attempt_span.record(
+                        "gen_ai.usage.output_tokens",
+                        response.usage.completion_tokens,
+                    );
                     attempts.push(ProviderAttempt {
                         provider_name: provider_name.clone(),
                         attempt_order,
@@ -144,6 +169,7 @@ pub async fn complete_chat(
                     });
                 }
                 Err(error) => {
+                    attempt_span.record("error.type", provider_error_category(&error).as_str());
                     attempts.push(ProviderAttempt {
                         provider_name: provider_name.clone(),
                         attempt_order,
@@ -214,14 +240,31 @@ pub async fn complete_chat_stream(
         let mut last_retryable_error = None;
 
         for retry_attempt in 0..=retry_policy.max_retries {
+            let next_attempt_order = attempt_order.saturating_add(1);
+            let attempt_span = tracing::info_span!(
+                "provider_stream_attempt",
+                "gen_ai.system" = "llm_provider",
+                "gen_ai.request.model" = request.model.as_deref().unwrap_or("unknown"),
+                "rustygate.provider.name" = provider_name.as_str(),
+                "rustygate.attempt.order" = next_attempt_order,
+                "rustygate.attempt.retry" = retry_attempt,
+                "rustygate.attempt.is_fallback" = is_fallback,
+                "rustygate.attempt.latency_ms" = field::Empty,
+                "error.type" = field::Empty,
+            );
             let started = Instant::now();
-            let result = entry.provider.chat_completion_stream(request.clone()).await;
+            let result = entry
+                .provider
+                .chat_completion_stream(request.clone())
+                .instrument(attempt_span.clone())
+                .await;
 
             match result {
                 Ok((context, mut stream)) => {
                     let first_event_result = stream.next().await;
                     let latency_ms = started.elapsed().as_millis() as u64;
-                    attempt_order = attempt_order.saturating_add(1);
+                    attempt_order = next_attempt_order;
+                    attempt_span.record("rustygate.attempt.latency_ms", latency_ms);
 
                     match first_event_result {
                         Some(Ok(first_event)) => {
@@ -244,6 +287,8 @@ pub async fn complete_chat_stream(
                             });
                         }
                         Some(Err(error)) => {
+                            attempt_span
+                                .record("error.type", provider_error_category(&error).as_str());
                             attempts.push(ProviderAttempt {
                                 provider_name: provider_name.clone(),
                                 attempt_order,
@@ -270,6 +315,8 @@ pub async fn complete_chat_stream(
                         }
                         None => {
                             let error = ProviderError::ProviderBadResponse;
+                            attempt_span
+                                .record("error.type", provider_error_category(&error).as_str());
                             attempts.push(ProviderAttempt {
                                 provider_name: provider_name.clone(),
                                 attempt_order,
@@ -287,7 +334,9 @@ pub async fn complete_chat_stream(
                 }
                 Err(error) => {
                     let latency_ms = started.elapsed().as_millis() as u64;
-                    attempt_order = attempt_order.saturating_add(1);
+                    attempt_order = next_attempt_order;
+                    attempt_span.record("rustygate.attempt.latency_ms", latency_ms);
+                    attempt_span.record("error.type", provider_error_category(&error).as_str());
                     attempts.push(ProviderAttempt {
                         provider_name: provider_name.clone(),
                         attempt_order,

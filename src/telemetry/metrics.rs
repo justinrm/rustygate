@@ -36,6 +36,8 @@ pub struct MetricsSnapshot {
     pub provider_errors_by_provider_and_category: BTreeMap<String, BTreeMap<String, u64>>,
     pub avg_latency_ms_by_provider: BTreeMap<String, f64>,
     pub p95_latency_ms_by_provider: BTreeMap<String, f64>,
+    pub cache_lookups_by_outcome: BTreeMap<String, u64>,
+    pub cache_hit_ratio: f64,
 }
 
 #[derive(Debug, Default)]
@@ -62,6 +64,7 @@ pub struct MetricsRegistry {
     provider_total_latency_ms: BTreeMap<String, u128>,
     latency_samples_ms: Vec<u64>,
     total_latency_ms: u128,
+    cache_lookups_by_outcome: BTreeMap<String, u64>,
 }
 
 impl MetricsRegistry {
@@ -103,6 +106,13 @@ impl MetricsRegistry {
         }];
 
         self.record_chat_failure(latency_ms, &attempts);
+    }
+
+    pub fn record_cache_lookup(&mut self, outcome: &str) {
+        *self
+            .cache_lookups_by_outcome
+            .entry(outcome.to_string())
+            .or_default() += 1;
     }
 
     pub fn record_chat_success(
@@ -176,6 +186,8 @@ impl MetricsRegistry {
                 .clone(),
             avg_latency_ms_by_provider: self.avg_latency_ms_by_provider(),
             p95_latency_ms_by_provider: self.p95_latency_ms_by_provider(),
+            cache_lookups_by_outcome: self.cache_lookups_by_outcome.clone(),
+            cache_hit_ratio: self.cache_hit_ratio(),
         }
     }
 
@@ -290,6 +302,25 @@ impl MetricsRegistry {
                 (provider_name.clone(), percentile_latency(samples, 0.95))
             })
             .collect()
+    }
+
+    fn cache_hit_ratio(&self) -> f64 {
+        let hits = self
+            .cache_lookups_by_outcome
+            .get("hit")
+            .copied()
+            .unwrap_or_default();
+        let misses = self
+            .cache_lookups_by_outcome
+            .get("miss")
+            .copied()
+            .unwrap_or_default();
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
     }
 }
 

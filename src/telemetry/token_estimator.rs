@@ -32,10 +32,14 @@ mod tests {
             ChatMessage {
                 role: ChatRole::User,
                 content: "hello there".into(),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: ChatRole::Assistant,
                 content: "general kenobi".into(),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
 

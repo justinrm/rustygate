@@ -27,12 +27,15 @@ Core implemented surface:
 - `GET /health`
 - `GET /ready`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `GET /v1/models`
 - `GET /stats`
 - `GET /stats/providers`
 - `GET /metrics`
 
-The MVP and post-MVP hardening are complete. Keep future work focused on validation, bugs, docs, and small hardening unless a new roadmap is explicitly opened. Do not add Kubernetes manifests, multi-user billing, complex authentication, Redis, semantic caching, a web dashboard, production policy engines, or full OpenAI API compatibility without explicit approval.
+The MVP and post-MVP hardening are complete. A `v0.3` portfolio-hardening roadmap is explicitly open for OpenTelemetry tracing, provider health checks, multi-key auth, bounded and optional Redis-backed rate limiting, tool calling, opt-in response caching, semantic caching behind a feature flag, and reproducible benchmarks. Keep this work small, documented, and testable.
+
+Do not add Kubernetes manifests, multi-user billing, a web dashboard, or production policy engines without explicit approval.
 
 ## Coding Standards
 

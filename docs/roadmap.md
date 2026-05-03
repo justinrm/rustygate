@@ -6,7 +6,7 @@ RustyGate should grow in small, reviewable steps.
 
 RustyGate is past the original MVP and now sits at a lightweight internal/demo gateway baseline. The current feature set includes mock and real providers, non-streaming and SSE streaming chat completions, gateway bearer auth, in-memory rate limiting, retries, fallback, circuit breakers, Prometheus-compatible metrics, model discovery, optional SQLite persistence, Docker, CI, deployment profiles, and an operations runbook.
 
-The project is now entering a focused `v0.2` compatibility scope. The goal is a Responses-first path toward OpenAI API compatibility while preserving the small, testable gateway shape.
+The project is now entering a focused `v0.3` portfolio-hardening scope. The goal is to strengthen the gateway with production-shaped capabilities that read well in review while preserving the small, testable gateway shape.
 
 ## MVP
 
@@ -62,12 +62,22 @@ Acceptance criteria:
 - Gateway-specific metadata remains available through existing operational endpoints rather than becoming required in OpenAI API responses.
 - Compatibility docs, examples, smoke checks, and integration tests stay synchronized with implemented behavior.
 
+## v0.3 Portfolio Hardening
+
+The `v0.3` track is explicitly approved to add the following production-shaped features in small, reviewable slices:
+
+- OpenTelemetry tracing across request handling, retries, fallback, provider attempts, streaming transitions, and cache checks.
+- Provider health probes that feed `/ready` and expose optional per-provider detail.
+- Multi-key authentication with hashed key storage, role-based access, key rotation, and per-key quotas.
+- Bounded local rate-limit state plus an optional Redis-backed rate-limit backend behind a Cargo feature.
+- End-to-end OpenAI-compatible function/tool calling for mock, OpenAI-compatible, and Anthropic provider paths.
+- Opt-in exact-match response caching with hit-rate metrics.
+- Optional semantic caching behind a Cargo feature after exact-match caching lands.
+- A reproducible benchmark page comparing RustyGate with a Python gateway baseline.
+
 ## Do Not Build Yet
 
 - Kubernetes manifests
 - Multi-user billing
-- Complex authentication
-- Redis
 - Web dashboard
-- Semantic caching
 - Production-grade policy engine

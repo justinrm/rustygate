@@ -20,6 +20,8 @@ pub struct StatsResponse {
     pub estimated_output_cost_usd: f64,
     pub estimated_total_cost_usd: f64,
     pub request_errors_by_category: BTreeMap<String, u64>,
+    pub cache_lookups_by_outcome: BTreeMap<String, u64>,
+    pub cache_hit_ratio: f64,
 }
 
 #[derive(Debug, Default, Serialize)]

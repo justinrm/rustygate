@@ -6,7 +6,8 @@ use std::{
 
 use axum::{
     extract::rejection::JsonRejection,
-    extract::State,
+    extract::{Extension, State},
+    http::{HeaderName, HeaderValue},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -15,11 +16,13 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{field, info, warn};
 use uuid::Uuid;
 
 use crate::{
     app::AppState,
+    auth::keys::AuthenticatedKey,
+    cache::response::cache_key_for_request,
     compat::openai_id,
     error::AppError,
     models::chat::{ChatCompletionRequest, TokenUsage},
@@ -32,13 +35,25 @@ use crate::{
 };
 
 const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
+const CACHE_HEADER: HeaderName = HeaderName::from_static("x-rustygate-cache");
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        route = CHAT_COMPLETIONS_ROUTE,
+        request_id = field::Empty,
+        gen_ai_system = "rustygate",
+        gen_ai_request_model = field::Empty
+    )
+)]
 pub async fn chat_completions(
     State(state): State<AppState>,
+    Extension(authenticated_key): Extension<AuthenticatedKey>,
     request: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Result<Response, AppError> {
     let started = Instant::now();
     let request_id = Uuid::new_v4();
+    tracing::Span::current().record("request_id", field::display(request_id));
     let metrics_guard = MetricsRequestGuard::new(&state);
     let Json(mut request) = match request {
         Ok(request) => request,
@@ -104,9 +119,44 @@ pub async fn chat_completions(
     }
 
     resolve_request_model_alias(&state, &mut request);
+    if let Some(model) = request.model.as_deref() {
+        tracing::Span::current().record("gen_ai_request_model", model);
+    }
 
     if request.stream_enabled() {
-        return stream_chat_completions(state, request, request_id, started, metrics_guard).await;
+        return stream_chat_completions(
+            state,
+            authenticated_key,
+            request,
+            request_id,
+            started,
+            metrics_guard,
+        )
+        .await;
+    }
+
+    let cache_key = cache_key_for_request(&request);
+    if state.response_cache.is_some() && !authenticated_key.cache_enabled {
+        record_cache_lookup(&state, "skip_disabled");
+    } else if let (Some(cache), Some(cache_key)) = (&state.response_cache, cache_key.as_ref()) {
+        let cache_span = tracing::info_span!("cache_lookup", "cache.hit" = false);
+        if let Some(response) = cache.get(cache_key).await {
+            cache_span.record("cache.hit", true);
+            record_cache_lookup(&state, "hit");
+            let mut response = Json(response).into_response();
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, HeaderValue::from_static("HIT"));
+            return Ok(response);
+        }
+        record_cache_lookup(&state, "miss");
+    } else if state.response_cache.is_some() {
+        let outcome = if request.temperature.unwrap_or_default() > 0.0 {
+            "skip_temperature"
+        } else {
+            "skip_tools"
+        };
+        record_cache_lookup(&state, outcome);
     }
 
     let metrics_snapshot = routing_metrics_snapshot(&state);
@@ -149,7 +199,30 @@ pub async fn chat_completions(
             )
             .await;
 
-            Ok(Json(success.response).into_response())
+            record_api_key_usage(
+                &state,
+                &authenticated_key,
+                u64::from(success.response.usage.total_tokens),
+                success.cost_estimate.total_cost_usd,
+            )
+            .await;
+
+            if authenticated_key.cache_enabled {
+                if let (Some(cache), Some(cache_key)) = (&state.response_cache, cache_key) {
+                    cache
+                        .put(
+                            cache_key,
+                            success.response.clone(),
+                            state.response_cache_ttl,
+                        )
+                        .await;
+                }
+            }
+            let mut response = Json(success.response).into_response();
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, HeaderValue::from_static("MISS"));
+            Ok(response)
         }
         Err(FallbackError::NoProviderAvailable) => {
             let latency_ms = started.elapsed().as_millis() as u64;
@@ -213,6 +286,7 @@ pub async fn chat_completions(
 
 async fn stream_chat_completions(
     state: AppState,
+    authenticated_key: AuthenticatedKey,
     request: ChatCompletionRequest,
     request_id: Uuid,
     started: Instant,
@@ -310,6 +384,7 @@ async fn stream_chat_completions(
 
             match next_item {
                 Some(Ok(ProviderStreamEvent::Chunk(mut chunk))) => {
+                    info!(request_id = %request_id, provider = %provider_name, "stream chunk emitted");
                     chunk.id = openai_id("chatcmpl", request_id);
                     let payload = match serde_json::to_string(&chunk) {
                         Ok(payload) => payload,
@@ -326,12 +401,14 @@ async fn stream_chat_completions(
                     yield Ok::<Event, Infallible>(Event::default().data(payload));
                 }
                 Some(Ok(ProviderStreamEvent::Completed { usage: completed_usage })) => {
+                    info!(request_id = %request_id, provider = %provider_name, "stream completed");
                     usage = Some(completed_usage);
                     yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
                     break;
                 }
                 Some(Err(error)) => {
                     stream_failed = true;
+                    warn!(request_id = %request_id, provider = %provider_name, "stream failed");
                     let provider_category = provider_error_category(&error);
                     let app_error = AppError::from_provider_error(error, Some(request_id));
                     let payload = stream_error_payload(&provider_name, request_id, &app_error);
@@ -401,12 +478,19 @@ async fn stream_chat_completions(
                     Some(provider_name.clone()),
                     RequestLogStatus::Success,
                     latency_ms,
-                    Some(usage),
+                    Some(usage.clone()),
                     Some(cost_estimate),
                     None,
                     &attempts,
                     state_for_stream.request_logging,
                 ),
+            )
+            .await;
+            record_api_key_usage(
+                &state_for_stream,
+                &authenticated_key,
+                u64::from(usage.total_tokens),
+                cost_estimate.total_cost_usd,
             )
             .await;
         }
@@ -415,6 +499,31 @@ async fn stream_chat_completions(
     Ok(Sse::new(event_stream)
         .keep_alive(KeepAlive::default())
         .into_response())
+}
+
+async fn record_api_key_usage(
+    state: &AppState,
+    authenticated_key: &AuthenticatedKey,
+    total_tokens: u64,
+    total_cost_usd: f64,
+) {
+    if let Err(error) = state
+        .key_store
+        .record_usage(&authenticated_key.id, total_tokens, total_cost_usd)
+        .await
+    {
+        warn!(
+            api_key_id = authenticated_key.id,
+            error = %error,
+            "failed to record API key usage"
+        );
+    }
+}
+
+fn record_cache_lookup(state: &AppState, outcome: &str) {
+    if let Ok(mut metrics) = state.metrics.lock() {
+        metrics.record_cache_lookup(outcome);
+    }
 }
 
 fn stream_error_payload(_provider_name: &str, request_id: Uuid, error: &AppError) -> String {

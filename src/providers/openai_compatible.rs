@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode};
+use reqwest::{header::HeaderMap, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -45,6 +45,26 @@ impl ChatProvider for OpenAiCompatibleProvider {
         self.model == model
     }
 
+    async fn health_check(&self) -> Result<(), ProviderError> {
+        let endpoint = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let mut headers = HeaderMap::new();
+        crate::telemetry::tracing::inject_trace_context(&mut headers);
+        let response = self
+            .client
+            .get(endpoint)
+            .bearer_auth(&self.api_key)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(map_http_status(response.status()))
+        }
+    }
+
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,
@@ -56,12 +76,20 @@ impl ChatProvider for OpenAiCompatibleProvider {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             stream: None,
+            tools: request.tools.clone(),
+            tool_choice: request.tool_choice.clone(),
+            parallel_tool_calls: request.parallel_tool_calls,
+            response_format: request.response_format.clone(),
         };
+
+        let mut headers = HeaderMap::new();
+        crate::telemetry::tracing::inject_trace_context(&mut headers);
 
         let response = self
             .client
             .post(endpoint)
             .bearer_auth(&self.api_key)
+            .headers(headers)
             .json(&outbound_request)
             .send()
             .await
@@ -82,6 +110,7 @@ impl ChatProvider for OpenAiCompatibleProvider {
             .next()
             .ok_or(ProviderError::ProviderBadResponse)?;
         let completion_text = first_choice.message.content;
+        let tool_calls = first_choice.message.tool_calls;
 
         let usage = parsed.usage.unwrap_or_else(|| {
             let prompt_tokens = estimate_tokens_for_messages(&request.messages);
@@ -95,7 +124,7 @@ impl ChatProvider for OpenAiCompatibleProvider {
 
         Ok(ChatCompletionResponse {
             id: openai_id("chatcmpl", Uuid::new_v4()),
-            object: "chat.completion",
+            object: "chat.completion".into(),
             created: parsed.created.unwrap_or(1_700_000_000),
             model: parsed.model,
             provider: self.name.clone(),
@@ -104,6 +133,8 @@ impl ChatProvider for OpenAiCompatibleProvider {
                 message: ChatMessage {
                     role: ChatRole::Assistant,
                     content: completion_text,
+                    tool_calls,
+                    tool_call_id: None,
                 },
                 finish_reason: first_choice
                     .finish_reason
@@ -128,12 +159,20 @@ impl ChatProvider for OpenAiCompatibleProvider {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             stream: Some(true),
+            tools: request.tools.clone(),
+            tool_choice: request.tool_choice.clone(),
+            parallel_tool_calls: request.parallel_tool_calls,
+            response_format: request.response_format.clone(),
         };
+
+        let mut headers = HeaderMap::new();
+        crate::telemetry::tracing::inject_trace_context(&mut headers);
 
         let response = self
             .client
             .post(endpoint)
             .bearer_auth(&self.api_key)
+            .headers(headers)
             .json(&outbound_request)
             .send()
             .await
@@ -197,6 +236,7 @@ impl ChatProvider for OpenAiCompatibleProvider {
                         ChatDelta {
                             role: delta.role,
                             content: delta.content,
+                            tool_calls: delta.tool_calls,
                         },
                         first_choice.finish_reason,
                     ));
@@ -228,6 +268,14 @@ struct OpenAiChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<crate::models::chat::Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<crate::models::chat::ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +298,8 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiAssistantMessage {
     content: String,
+    #[serde(default)]
+    tool_calls: Option<Vec<crate::models::chat::ToolCall>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,6 +330,8 @@ struct OpenAiStreamDelta {
     role: Option<ChatRole>,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<crate::models::chat::ToolCallDelta>>,
 }
 
 fn map_http_status(status: StatusCode) -> ProviderError {

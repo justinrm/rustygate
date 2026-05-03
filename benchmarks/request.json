@@ -1,0 +1,11 @@
+{
+  "model": "mock-fast-v1",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Return a short benchmark response."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 64
+}

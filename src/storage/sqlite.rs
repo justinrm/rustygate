@@ -48,6 +48,26 @@ impl SqliteRequestLogStore {
         Self { pool }
     }
 
+    pub async fn prune_older_than(&self, cutoff_unix_seconds: u64) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM provider_attempts WHERE request_id IN (SELECT id FROM request_logs WHERE created_at_unix_seconds < ?)",
+        )
+        .bind(cutoff_unix_seconds as i64)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM request_logs WHERE created_at_unix_seconds < ?")
+            .bind(cutoff_unix_seconds as i64)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM api_key_usage_daily WHERE day_unix < ?")
+            .bind((cutoff_unix_seconds / 86_400) as i64)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn record_request(&self, entry: &RequestLogEntry) -> Result<(), StorageError> {
         let mut transaction = self.pool.begin().await?;
         let prompt_messages_json = entry

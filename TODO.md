@@ -4,7 +4,19 @@
 
 RustyGate is a lightweight Rust inference gateway that exposes a simplified OpenAI-compatible chat endpoint, routes requests to mock and real providers, supports non-streaming and SSE streaming responses, records latency/token/cost/error metadata, and handles retries, fallback, and circuit breaker recovery.
 
-The MVP and post-MVP hardening milestones below are complete for a lightweight internal/demo gateway. A focused `v0.2` roadmap is now open for Responses-first OpenAI compatibility while keeping the project small and reviewable.
+The MVP, `v0.2` Responses compatibility work, and the `v0.3` portfolio-hardening follow-ups are complete for a lightweight internal/demo gateway. Keep future work small, documented, and clearly labeled as demo or production-shaped.
+
+### v0.3 Portfolio Hardening (Complete)
+
+- [x] OpenTelemetry tracing with provider-attempt spans and a demo bundle.
+- [x] Provider health probes feeding `/ready`.
+- [x] Multi-key auth with hashed SQLite storage, roles, quotas, and an admin CLI.
+- [x] Bounded local rate-limit state and optional Redis-backed rate limiting.
+- [x] Tool/function calling support across mock, OpenAI-compatible, and Anthropic provider paths.
+- [x] Opt-in exact-match response caching with hit/miss metrics.
+- [x] Experimental semantic-cache feature gate.
+- [x] Benchmark harness and benchmark documentation.
+- [x] Integration tests for auth, caching, health, tools, Redis feature wiring, and semantic cache behavior.
 
 ### How To Use This Checklist
 

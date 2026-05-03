@@ -22,8 +22,8 @@ flowchart LR
 
 ## Request Lifecycle
 
-1. Protected routes require `Authorization: Bearer` using the configured gateway API key; `/health` and `/ready` remain unauthenticated.
-2. In-memory global and per-key rate limits are checked before protected route handlers run.
+1. Protected routes require `Authorization: Bearer`; with SQLite enabled, keys are looked up by prefix and verified with argon2 hashes. `/health` and `/ready` remain unauthenticated.
+2. Global rate limits are checked before auth; per-key limits and per-key quotas are checked after auth.
 3. The HTTP layer accepts OpenAI-compatible requests, with `/v1/responses` as the canonical modern surface and `/v1/chat/completions` retained for legacy clients.
 4. The request gets a gateway request ID before validation so client-facing errors and logs can be correlated.
 5. Request shape, body size, message count, and message content limits are validated.
@@ -34,8 +34,22 @@ flowchart LR
 10. Provider responses are normalized into OpenAI-shaped response types for non-streaming JSON or SSE streaming responses.
 11. Metrics record latency, success/failure, provider attempts, prompt/completion token estimates, and input/output cost estimates in memory with bounded latency samples.
 12. Structured request metadata logs record request ID, route, model, provider, status, latency, token estimates, cost estimate, fallback attempts, and classified error category without prompt content by default.
-13. Optional SQLite persistence stores request logs and provider attempts when enabled.
-14. The client receives JSON or SSE responses without internal stack traces, provider raw errors, or secrets.
+13. Optional exact-match caching can return deterministic non-streaming responses before provider routing and records cache hit/miss metrics.
+14. Optional SQLite persistence stores request logs, provider attempts, API keys, quota usage, and SQLite cache entries when enabled.
+15. The client receives JSON or SSE responses without internal stack traces, provider raw errors, or secrets.
+
+## Hardened Request Flow
+
+```mermaid
+flowchart LR
+    Client[Client] --> PreLimit[Global Rate Limit]
+    PreLimit --> Auth[Key Auth And Role Check]
+    Auth --> PerKeyLimit[Per-Key Limit And Quota]
+    PerKeyLimit --> Cache[Optional Response Cache]
+    Cache --> Fallback[Retry And Fallback]
+    Fallback --> Provider[Provider]
+    Provider --> Metrics[Metrics Logs Traces]
+```
 
 ## Module Responsibilities
 
@@ -44,6 +58,8 @@ flowchart LR
 - `src/compat.rs`: shared OpenAI-compatible public ID and timestamp helpers.
 - `src/providers`: async provider trait, mock provider, OpenAI-compatible provider, and Anthropic provider.
 - `src/routing`: provider selection, retries, and fallback.
+- `src/auth`: hashed API key storage, role checks, and quota accounting.
+- `src/cache`: exact-match and experimental semantic response caching.
 - `src/telemetry`: in-memory metrics and safe request metadata models.
 - `src/storage`: memory storage plus optional SQLite request log persistence.
 - `src/config.rs`: TOML configuration and safe local defaults.
@@ -75,7 +91,7 @@ Metrics should be updated after each request attempt and after the final request
 
 Track total requests, successes, failures, in-flight requests, latency, selected provider, fallback attempts, provider error categories, prompt/completion tokens, input/output estimated cost, and provider-level latency.
 
-Request metadata logging is wired with structured `tracing` fields and optional SQLite persistence. Startup, HTTP, request, and provider-attempt logs avoid prompt content by default.
+Request metadata logging is wired with structured `tracing` fields and optional SQLite persistence. Startup, HTTP, request, cache, and provider-attempt logs avoid prompt content by default. OpenTelemetry export is optional and configured through `[telemetry]`.
 
 ## Security Considerations
 

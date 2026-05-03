@@ -13,6 +13,10 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub gateway: GatewayConfig,
     #[serde(default)]
+    pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
@@ -30,6 +34,8 @@ pub struct ServerConfig {
 pub struct GatewayConfig {
     pub default_timeout_ms: u64,
     pub max_retries: u32,
+    #[serde(default = "default_health_check_interval_ms")]
+    pub health_check_interval_ms: u64,
     #[serde(default)]
     pub routing_policy: RoutingPolicy,
     #[serde(default)]
@@ -45,6 +51,83 @@ pub struct GatewayConfig {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub request_limits: RequestLimitsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelemetryConfig {
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub backend: CacheBackendConfig,
+    #[serde(default = "default_cache_default_ttl_seconds")]
+    pub default_ttl_seconds: u64,
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+    #[serde(default)]
+    pub semantic: SemanticCacheConfig,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: CacheBackendConfig::Memory,
+            default_ttl_seconds: default_cache_default_ttl_seconds(),
+            max_entries: default_cache_max_entries(),
+            semantic: SemanticCacheConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheBackendConfig {
+    #[default]
+    Memory,
+    Sqlite,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub embedding_provider: Option<String>,
+    #[serde(default = "default_semantic_similarity_threshold")]
+    pub similarity_threshold: f32,
+    #[serde(default = "default_semantic_index_capacity")]
+    pub index_capacity: usize,
+}
+
+impl Default for SemanticCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            embedding_provider: None,
+            similarity_threshold: default_semantic_similarity_threshold(),
+            index_capacity: default_semantic_index_capacity(),
+        }
+    }
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            service_name: default_service_name(),
+            otlp_endpoint: None,
+            sample_ratio: default_sample_ratio(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -98,6 +181,8 @@ impl Default for GatewayCircuitBreakerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
+    #[serde(default)]
+    pub backend: RateLimitBackendConfig,
     #[serde(default = "default_global_requests_per_minute")]
     pub global_requests_per_minute: u32,
     #[serde(default = "default_global_burst_size")]
@@ -106,17 +191,35 @@ pub struct RateLimitConfig {
     pub per_key_requests_per_minute: u32,
     #[serde(default = "default_per_key_burst_size")]
     pub per_key_burst_size: u32,
+    #[serde(default = "default_max_tracked_keys")]
+    pub max_tracked_keys: usize,
+    #[serde(default)]
+    pub redis_url_env: Option<String>,
+    #[serde(default = "default_redis_fallback_to_local")]
+    pub redis_fallback_to_local: bool,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
+            backend: RateLimitBackendConfig::Local,
             global_requests_per_minute: default_global_requests_per_minute(),
             global_burst_size: default_global_burst_size(),
             per_key_requests_per_minute: default_per_key_requests_per_minute(),
             per_key_burst_size: default_per_key_burst_size(),
+            max_tracked_keys: default_max_tracked_keys(),
+            redis_url_env: None,
+            redis_fallback_to_local: default_redis_fallback_to_local(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitBackendConfig {
+    #[default]
+    Local,
+    Redis,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +248,8 @@ pub struct StorageConfig {
     pub enabled: bool,
     #[serde(default = "default_database_url")]
     pub database_url: String,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
 }
 
 impl Default for StorageConfig {
@@ -152,6 +257,7 @@ impl Default for StorageConfig {
         Self {
             enabled: false,
             database_url: default_database_url(),
+            retention_days: default_retention_days(),
         }
     }
 }
@@ -202,6 +308,10 @@ fn default_database_url() -> String {
     "sqlite://rustygate.db".into()
 }
 
+fn default_retention_days() -> u64 {
+    30
+}
+
 fn default_shutdown_grace_period_ms() -> u64 {
     10_000
 }
@@ -210,8 +320,36 @@ fn default_failure_rate() -> f64 {
     0.0
 }
 
+fn default_service_name() -> String {
+    "rustygate".into()
+}
+
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+
+fn default_cache_default_ttl_seconds() -> u64 {
+    600
+}
+
+fn default_cache_max_entries() -> usize {
+    10_000
+}
+
+fn default_semantic_similarity_threshold() -> f32 {
+    0.95
+}
+
+fn default_semantic_index_capacity() -> usize {
+    10_000
+}
+
 fn default_retry_initial_backoff_ms() -> u64 {
     100
+}
+
+fn default_health_check_interval_ms() -> u64 {
+    30_000
 }
 
 fn default_retry_max_backoff_ms() -> u64 {
@@ -248,6 +386,14 @@ fn default_per_key_requests_per_minute() -> u32 {
 
 fn default_per_key_burst_size() -> u32 {
     20
+}
+
+fn default_max_tracked_keys() -> usize {
+    10_000
+}
+
+fn default_redis_fallback_to_local() -> bool {
+    true
 }
 
 fn default_max_chat_body_bytes() -> usize {
@@ -297,6 +443,8 @@ impl AppConfig {
         }
 
         validate_gateway_config(&self.gateway, &mut errors);
+        validate_telemetry_config(&self.telemetry, &mut errors);
+        validate_cache_config(&self.cache, &mut errors);
         validate_storage_config(&self.storage, &mut errors);
         validate_providers(&self.providers, &self.gateway, &mut errors);
 
@@ -308,9 +456,52 @@ impl AppConfig {
     }
 }
 
+fn validate_cache_config(cache: &CacheConfig, errors: &mut Vec<String>) {
+    if cache.enabled && cache.default_ttl_seconds == 0 {
+        errors
+            .push("cache.default_ttl_seconds must be greater than 0 when cache is enabled".into());
+    }
+    if cache.enabled && cache.max_entries == 0 {
+        errors.push("cache.max_entries must be greater than 0 when cache is enabled".into());
+    }
+    if cache.semantic.enabled && cache.semantic.embedding_provider.is_none() {
+        errors.push(
+            "cache.semantic.embedding_provider must be set when semantic cache is enabled".into(),
+        );
+    }
+    if !(0.0..=1.0).contains(&cache.semantic.similarity_threshold) {
+        errors.push("cache.semantic.similarity_threshold must be between 0.0 and 1.0".into());
+    }
+    if cache.semantic.enabled && cache.semantic.index_capacity == 0 {
+        errors.push(
+            "cache.semantic.index_capacity must be greater than 0 when semantic cache is enabled"
+                .into(),
+        );
+    }
+}
+
+fn validate_telemetry_config(telemetry: &TelemetryConfig, errors: &mut Vec<String>) {
+    if telemetry.service_name.trim().is_empty() {
+        errors.push("telemetry.service_name must not be empty".into());
+    }
+    if !(0.0..=1.0).contains(&telemetry.sample_ratio) {
+        errors.push("telemetry.sample_ratio must be between 0.0 and 1.0".into());
+    }
+    if telemetry
+        .otlp_endpoint
+        .as_deref()
+        .is_some_and(|endpoint| endpoint.trim().is_empty())
+    {
+        errors.push("telemetry.otlp_endpoint must not be empty when set".into());
+    }
+}
+
 fn validate_gateway_config(gateway: &GatewayConfig, errors: &mut Vec<String>) {
     if gateway.default_timeout_ms == 0 {
         errors.push("gateway.default_timeout_ms must be greater than 0".to_string());
+    }
+    if gateway.health_check_interval_ms == 0 {
+        errors.push("gateway.health_check_interval_ms must be greater than 0".to_string());
     }
     if gateway.api_key_env.trim().is_empty() {
         errors.push("gateway.api_key_env must not be empty".to_string());
@@ -351,6 +542,20 @@ fn validate_gateway_config(gateway: &GatewayConfig, errors: &mut Vec<String>) {
     if gateway.rate_limit.per_key_burst_size == 0 {
         errors.push("gateway.rate_limit.per_key_burst_size must be greater than 0".into());
     }
+    if gateway.rate_limit.max_tracked_keys == 0 {
+        errors.push("gateway.rate_limit.max_tracked_keys must be greater than 0".into());
+    }
+    if gateway.rate_limit.backend == RateLimitBackendConfig::Redis
+        && gateway
+            .rate_limit
+            .redis_url_env
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        errors.push("gateway.rate_limit.redis_url_env must be set when backend is redis".into());
+    }
 
     if gateway.request_limits.max_chat_body_bytes == 0 {
         errors.push("gateway.request_limits.max_chat_body_bytes must be greater than 0".into());
@@ -379,6 +584,9 @@ fn validate_gateway_config(gateway: &GatewayConfig, errors: &mut Vec<String>) {
 fn validate_storage_config(storage: &StorageConfig, errors: &mut Vec<String>) {
     if storage.enabled && storage.database_url.trim().is_empty() {
         errors.push("storage.database_url must not be empty when storage is enabled".to_string());
+    }
+    if storage.enabled && storage.retention_days == 0 {
+        errors.push("storage.retention_days must be greater than 0 when storage is enabled".into());
     }
 }
 

@@ -17,7 +17,12 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{
-    config::{AppConfig, GatewayConfig, ProviderConfig, ProviderKind, RoutingPolicy},
+    auth::keys::{AuthenticatedKey, SharedKeyStore, SqliteKeyStore, StaticKeyStore},
+    cache::response::{MemoryResponseCache, ResponseCache, SqliteResponseCache},
+    config::{
+        AppConfig, CacheBackendConfig, GatewayConfig, ProviderConfig, ProviderKind,
+        RateLimitBackendConfig, RoutingPolicy,
+    },
     error::AppError,
     models::chat::ChatValidationLimits,
     providers::{
@@ -26,8 +31,9 @@ use crate::{
         openai_compatible::OpenAiCompatibleProvider,
         provider::{ChatProvider, ProviderEntry, ProviderPricing},
     },
-    rate_limit::RateLimiter,
+    rate_limit::{RateLimitBackend, RateLimiter},
     routes,
+    routing::health::{ProviderHealthRegistry, SharedProviderHealthRegistry},
     routing::resilience::{
         CircuitBreakerPolicy, ProviderResiliencePolicy, ResilienceRegistry, RetryPolicy,
     },
@@ -39,6 +45,8 @@ use crate::{
 pub enum AppStateInitError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Auth(#[from] crate::auth::keys::AuthError),
     #[error("gateway configuration error: {message}")]
     GatewayConfig { message: String },
     #[error("provider configuration error for `{provider}`: {message}")]
@@ -51,22 +59,24 @@ pub struct AppState {
     pub metrics: Arc<Mutex<MetricsRegistry>>,
     pub request_logging: RequestLoggingConfig,
     pub request_log_store: Option<Arc<SqliteRequestLogStore>>,
-    pub gateway_api_key: Arc<str>,
+    pub response_cache: Option<Arc<dyn ResponseCache>>,
+    pub response_cache_ttl: Duration,
+    pub key_store: SharedKeyStore,
     pub rate_limiter: RateLimiter,
+    pub rate_limit_backend: Arc<dyn RateLimitBackend>,
+    pub rate_limit_backend_is_redis: bool,
     pub resilience: Arc<ResilienceRegistry>,
+    pub provider_health: SharedProviderHealthRegistry,
     pub chat_validation_limits: ChatValidationLimits,
     pub max_chat_body_bytes: usize,
     pub model_aliases: Arc<BTreeMap<String, String>>,
     pub routing_policy: RoutingPolicy,
 }
 
-#[derive(Clone)]
-struct AuthenticatedApiKey(String);
-
 const DEFAULT_GATEWAY_API_KEY: &str = "test-gateway-key";
 
-fn default_gateway_api_key() -> Arc<str> {
-    Arc::<str>::from(DEFAULT_GATEWAY_API_KEY)
+fn default_key_store() -> SharedKeyStore {
+    Arc::new(StaticKeyStore::new(DEFAULT_GATEWAY_API_KEY))
 }
 
 fn default_resilience_registry(provider_names: &[String]) -> Arc<ResilienceRegistry> {
@@ -84,9 +94,14 @@ impl Default for AppState {
             metrics: Arc::new(Mutex::new(MetricsRegistry::default())),
             request_logging: RequestLoggingConfig::default(),
             request_log_store: None,
-            gateway_api_key: default_gateway_api_key(),
+            response_cache: None,
+            response_cache_ttl: Duration::from_secs(600),
+            key_store: default_key_store(),
             rate_limiter: RateLimiter::new(&Default::default()),
+            rate_limit_backend: Arc::new(RateLimiter::new(&Default::default())),
+            rate_limit_backend_is_redis: false,
             resilience: default_resilience_registry(&[]),
+            provider_health: Arc::new(ProviderHealthRegistry::new(&[])),
             chat_validation_limits: ChatValidationLimits::default(),
             max_chat_body_bytes: 65_536,
             model_aliases: Arc::new(BTreeMap::new()),
@@ -99,6 +114,12 @@ impl AppState {
     pub fn from_providers(mut providers: Vec<ProviderEntry>) -> Self {
         providers.sort_by_key(|entry| entry.priority);
         Self {
+            provider_health: Arc::new(ProviderHealthRegistry::new(
+                &providers
+                    .iter()
+                    .map(|entry| entry.provider.name().to_string())
+                    .collect::<Vec<_>>(),
+            )),
             resilience: default_resilience_registry(
                 &providers
                     .iter()
@@ -109,8 +130,12 @@ impl AppState {
             metrics: Arc::new(Mutex::new(MetricsRegistry::default())),
             request_logging: RequestLoggingConfig::default(),
             request_log_store: None,
-            gateway_api_key: default_gateway_api_key(),
+            response_cache: None,
+            response_cache_ttl: Duration::from_secs(600),
+            key_store: default_key_store(),
             rate_limiter: RateLimiter::new(&Default::default()),
+            rate_limit_backend: Arc::new(RateLimiter::new(&Default::default())),
+            rate_limit_backend_is_redis: false,
             chat_validation_limits: ChatValidationLimits::default(),
             max_chat_body_bytes: 65_536,
             model_aliases: Arc::new(BTreeMap::new()),
@@ -119,23 +144,6 @@ impl AppState {
     }
 
     pub async fn from_config(config: &AppConfig) -> Result<Self, AppStateInitError> {
-        let gateway_api_key = env::var(&config.gateway.api_key_env).map_err(|_| {
-            AppStateInitError::GatewayConfig {
-                message: format!(
-                    "environment variable `{}` is not set for gateway API key",
-                    config.gateway.api_key_env
-                ),
-            }
-        })?;
-        if gateway_api_key.trim().is_empty() {
-            return Err(AppStateInitError::GatewayConfig {
-                message: format!(
-                    "environment variable `{}` for gateway API key must not be empty",
-                    config.gateway.api_key_env
-                ),
-            });
-        }
-
         let mut providers = Vec::with_capacity(config.providers.len());
         let mut provider_policies = HashMap::with_capacity(config.providers.len());
 
@@ -242,8 +250,33 @@ impl AppState {
                 enabled: config.gateway.enable_request_logging,
                 log_prompt_content: config.gateway.log_prompt_content,
             });
-        state.gateway_api_key = Arc::from(gateway_api_key);
+        state.key_store = if config.storage.enabled {
+            Arc::new(SqliteKeyStore::connect(&config.storage.database_url).await?)
+        } else {
+            let gateway_api_key = env::var(&config.gateway.api_key_env).map_err(|_| {
+                AppStateInitError::GatewayConfig {
+                    message: format!(
+                        "environment variable `{}` is not set for gateway API key",
+                        config.gateway.api_key_env
+                    ),
+                }
+            })?;
+            if gateway_api_key.trim().is_empty() {
+                return Err(AppStateInitError::GatewayConfig {
+                    message: format!(
+                        "environment variable `{}` for gateway API key must not be empty",
+                        config.gateway.api_key_env
+                    ),
+                });
+            }
+            Arc::new(StaticKeyStore::new(gateway_api_key))
+        };
         state.rate_limiter = RateLimiter::new(&config.gateway.rate_limit);
+        state.rate_limit_backend =
+            build_rate_limit_backend(&config.gateway.rate_limit, state.rate_limiter.clone())
+                .await?;
+        state.rate_limit_backend_is_redis =
+            config.gateway.rate_limit.backend == RateLimitBackendConfig::Redis;
         state.chat_validation_limits = ChatValidationLimits {
             max_messages_per_request: config.gateway.request_limits.max_messages_per_request,
             max_message_content_chars: config.gateway.request_limits.max_message_content_chars,
@@ -251,6 +284,10 @@ impl AppState {
         state.max_chat_body_bytes = config.gateway.request_limits.max_chat_body_bytes;
         state.model_aliases = Arc::new(config.gateway.model_aliases.clone());
         state.routing_policy = config.gateway.routing_policy;
+        if config.cache.enabled {
+            state.response_cache = Some(build_response_cache(config).await?);
+            state.response_cache_ttl = Duration::from_secs(config.cache.default_ttl_seconds);
+        }
         state.resilience = Arc::new(ResilienceRegistry::new(
             gateway_resilience_defaults(&config.gateway),
             provider_policies,
@@ -330,11 +367,76 @@ fn provider_resilience_policy(
     }
 }
 
+async fn build_response_cache(
+    config: &AppConfig,
+) -> Result<Arc<dyn ResponseCache>, AppStateInitError> {
+    match config.cache.backend {
+        CacheBackendConfig::Memory => Ok(Arc::new(MemoryResponseCache::new(
+            Duration::from_secs(config.cache.default_ttl_seconds),
+            config.cache.max_entries,
+        ))),
+        CacheBackendConfig::Sqlite => {
+            let store = SqliteKeyStore::connect(&config.storage.database_url).await?;
+            let pool = store.pool().clone();
+            Ok(Arc::new(SqliteResponseCache::new(pool)))
+        }
+    }
+}
+
+async fn build_rate_limit_backend(
+    config: &crate::config::RateLimitConfig,
+    local: RateLimiter,
+) -> Result<Arc<dyn RateLimitBackend>, AppStateInitError> {
+    match config.backend {
+        RateLimitBackendConfig::Local => Ok(Arc::new(local)),
+        RateLimitBackendConfig::Redis => build_redis_rate_limit_backend(config, local).await,
+    }
+}
+
+#[cfg(feature = "redis-backend")]
+async fn build_redis_rate_limit_backend(
+    config: &crate::config::RateLimitConfig,
+    local: RateLimiter,
+) -> Result<Arc<dyn RateLimitBackend>, AppStateInitError> {
+    let env_name =
+        config
+            .redis_url_env
+            .as_deref()
+            .ok_or_else(|| AppStateInitError::GatewayConfig {
+                message: "gateway.rate_limit.redis_url_env is required for redis backend".into(),
+            })?;
+    let redis_url = env::var(env_name).map_err(|_| AppStateInitError::GatewayConfig {
+        message: format!("environment variable `{env_name}` is not set for Redis rate limiting"),
+    })?;
+    let fallback = config.redis_fallback_to_local.then_some(local);
+    let backend = crate::rate_limit::redis_backend::RedisRateLimitBackend::connect(
+        &redis_url, config, fallback,
+    )
+    .await
+    .map_err(|error| AppStateInitError::GatewayConfig {
+        message: format!("failed to connect Redis rate-limit backend: {error}"),
+    })?;
+    Ok(Arc::new(backend))
+}
+
+#[cfg(not(feature = "redis-backend"))]
+async fn build_redis_rate_limit_backend(
+    _config: &crate::config::RateLimitConfig,
+    _local: RateLimiter,
+) -> Result<Arc<dyn RateLimitBackend>, AppStateInitError> {
+    Err(AppStateInitError::GatewayConfig {
+        message: "redis rate-limit backend requires the `redis-backend` feature".into(),
+    })
+}
+
 pub fn router() -> Router {
     router_with_state(AppState::default())
 }
 
-pub fn router_with_state(state: AppState) -> Router {
+pub fn router_with_state(mut state: AppState) -> Router {
+    if !state.rate_limit_backend_is_redis {
+        state.rate_limit_backend = Arc::new(state.rate_limiter.clone());
+    }
     let max_chat_body_bytes = state.max_chat_body_bytes;
     let protected_routes = Router::new()
         .route("/v1/responses", post(routes::compat::responses))
@@ -436,21 +538,26 @@ async fn auth_middleware(
         }
         .into_response();
     };
-    let api_key = api_key.to_string();
+    let authenticated_key = match state.key_store.authenticate(api_key).await {
+        Ok(Some(key)) => key,
+        Ok(None) | Err(_) => {
+            return AppError::Unauthorized {
+                message: "invalid bearer token".into(),
+                request_id: Some(Uuid::new_v4()),
+            }
+            .into_response();
+        }
+    };
 
-    if default_key_is_not_allowed(state.gateway_api_key.as_ref())
-        || !constant_time_eq(&api_key, state.gateway_api_key.as_ref())
-    {
-        return AppError::Unauthorized {
-            message: "invalid bearer token".into(),
+    if !role_allows_path(authenticated_key.role, request.uri().path()) {
+        return AppError::Forbidden {
+            message: "API key is not allowed to access this route".into(),
             request_id: Some(Uuid::new_v4()),
         }
         .into_response();
     }
 
-    request
-        .extensions_mut()
-        .insert(AuthenticatedApiKey(api_key));
+    request.extensions_mut().insert(authenticated_key);
     next.run(request).await
 }
 
@@ -459,7 +566,7 @@ async fn pre_auth_rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    if let Err(retry_after_seconds) = state.rate_limiter.check_global() {
+    if let Err(retry_after_seconds) = state.rate_limit_backend.check_global().await {
         return AppError::GatewayRateLimited {
             request_id: Some(Uuid::new_v4()),
             retry_after_seconds,
@@ -475,13 +582,31 @@ async fn per_key_rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let api_key = request
-        .extensions()
-        .get::<AuthenticatedApiKey>()
-        .map(|key| key.0.as_str())
-        .unwrap_or("unknown");
+    let Some(api_key) = request.extensions().get::<AuthenticatedKey>().cloned() else {
+        return AppError::Unauthorized {
+            message: "missing authenticated API key".into(),
+            request_id: Some(Uuid::new_v4()),
+        }
+        .into_response();
+    };
 
-    if let Err(retry_after_seconds) = state.rate_limiter.check_key(api_key) {
+    if let Err(quota) = state.key_store.check_quota(&api_key).await {
+        return AppError::GatewayRateLimited {
+            request_id: Some(Uuid::new_v4()),
+            retry_after_seconds: quota.retry_after_seconds,
+        }
+        .into_response();
+    }
+
+    let burst = api_key
+        .limits
+        .requests_per_minute
+        .map(|rpm| (rpm / 4).max(1));
+    if let Err(retry_after_seconds) = state
+        .rate_limit_backend
+        .check_key(&api_key.id, api_key.limits.requests_per_minute, burst)
+        .await
+    {
         return AppError::GatewayRateLimited {
             request_id: Some(Uuid::new_v4()),
             retry_after_seconds,
@@ -502,21 +627,12 @@ fn bearer_token(request: &Request) -> Option<&str> {
     Some(token)
 }
 
-fn constant_time_eq(candidate: &str, expected: &str) -> bool {
-    let candidate = candidate.as_bytes();
-    let expected = expected.as_bytes();
-    let mut diff = candidate.len() ^ expected.len();
-
-    for (index, expected_byte) in expected.iter().enumerate() {
-        let candidate_byte = candidate.get(index).copied().unwrap_or_default();
-        diff |= usize::from(candidate_byte ^ *expected_byte);
+fn role_allows_path(role: crate::auth::keys::KeyRole, path: &str) -> bool {
+    if path == "/stats" || path == "/stats/providers" || path == "/metrics" {
+        role.allows_observability()
+    } else {
+        role.allows_inference() || path == "/v1/models"
     }
-
-    diff == 0
-}
-
-fn default_key_is_not_allowed(configured_key: &str) -> bool {
-    !cfg!(debug_assertions) && configured_key == DEFAULT_GATEWAY_API_KEY
 }
 
 #[cfg(test)]
@@ -575,6 +691,7 @@ mod tests {
         let gateway = GatewayConfig {
             default_timeout_ms: 30_000,
             max_retries: 1,
+            health_check_interval_ms: 30_000,
             routing_policy: RoutingPolicy::Priority,
             model_aliases: BTreeMap::new(),
             retry: GatewayRetryConfig {
@@ -631,6 +748,7 @@ mod tests {
         let gateway = GatewayConfig {
             default_timeout_ms: 20_000,
             max_retries: 2,
+            health_check_interval_ms: 30_000,
             routing_policy: RoutingPolicy::Priority,
             model_aliases: BTreeMap::new(),
             retry: GatewayRetryConfig {

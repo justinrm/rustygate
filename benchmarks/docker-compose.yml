@@ -1,0 +1,17 @@
+services:
+  rustygate:
+    build:
+      context: ..
+    environment:
+      RUSTYGATE_CONFIG: examples/mock-config.toml
+      RUSTYGATE_GATEWAY_API_KEY: benchmark-key
+    ports:
+      - "8080:8080"
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    command: ["--config", "/app/litellm_config.yaml", "--port", "4000"]
+    volumes:
+      - ./litellm_config.yaml:/app/litellm_config.yaml:ro
+    ports:
+      - "4000:4000"

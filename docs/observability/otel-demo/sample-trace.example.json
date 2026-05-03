@@ -1,0 +1,33 @@
+{
+  "_comment": "Synthetic fixture showing the expected RustyGate span shape. Run run-demo.sh to export a real Jaeger trace as latest-trace.json.",
+  "data": [
+    {
+      "traceID": "00000000000000000000000000000001",
+      "spans": [
+        {
+          "spanID": "0000000000000001",
+          "operationName": "chat_completions",
+          "tags": [
+            { "key": "route", "value": "/v1/chat/completions" },
+            { "key": "gen_ai.system", "value": "rustygate" },
+            { "key": "gen_ai.request.model", "value": "mock-fast-v1" }
+          ]
+        },
+        {
+          "spanID": "0000000000000002",
+          "operationName": "provider_attempt",
+          "references": [
+            { "refType": "CHILD_OF", "spanID": "0000000000000001" }
+          ],
+          "tags": [
+            { "key": "rustygate.provider.name", "value": "mock-fast" },
+            { "key": "rustygate.attempt.order", "value": 1 },
+            { "key": "rustygate.attempt.is_fallback", "value": false },
+            { "key": "gen_ai.usage.input_tokens", "value": 8 },
+            { "key": "gen_ai.usage.output_tokens", "value": 5 }
+          ]
+        }
+      ]
+    }
+  ]
+}

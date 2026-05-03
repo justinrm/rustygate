@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode};
+use reqwest::{header::HeaderMap, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -12,6 +12,11 @@ use crate::{
         ChatDelta, ChatMessage, ChatRole, TokenUsage,
     },
     providers::{
+        anthropic_tool_translation::{
+            anthropic_content_to_openai_message, openai_tool_choice_to_anthropic,
+            openai_tools_to_anthropic, AnthropicContentBlock, AnthropicTool, AnthropicToolChoice,
+            AnthropicToolStreamTranslator,
+        },
         provider::{
             ChatProvider, ProviderError, ProviderStream, ProviderStreamContext, ProviderStreamEvent,
         },
@@ -52,6 +57,11 @@ impl ChatProvider for AnthropicProvider {
     ) -> Result<ChatCompletionResponse, ProviderError> {
         let endpoint = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let (system, messages) = split_system_messages(request.messages.clone());
+        let tools = request.tools.as_deref().map(openai_tools_to_anthropic);
+        let tool_choice = request
+            .tool_choice
+            .as_ref()
+            .and_then(openai_tool_choice_to_anthropic);
         let outbound_request = AnthropicMessagesRequest {
             model: request.model.clone().unwrap_or_else(|| self.model.clone()),
             max_tokens: request.max_tokens.unwrap_or(512),
@@ -59,11 +69,17 @@ impl ChatProvider for AnthropicProvider {
             system,
             temperature: request.temperature,
             stream: None,
+            tools,
+            tool_choice,
         };
+
+        let mut headers = HeaderMap::new();
+        crate::telemetry::tracing::inject_trace_context(&mut headers);
 
         let response = self
             .client
             .post(endpoint)
+            .headers(headers)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
             .json(&outbound_request)
@@ -79,12 +95,10 @@ impl ChatProvider for AnthropicProvider {
             .json()
             .await
             .map_err(|_| ProviderError::ProviderBadResponse)?;
-        let completion_text = parsed
-            .content
-            .iter()
-            .find(|item| item.kind == "text")
-            .and_then(|item| item.text.clone())
-            .ok_or(ProviderError::ProviderBadResponse)?;
+        let (completion_text, tool_calls) = anthropic_content_to_openai_message(&parsed.content);
+        if completion_text.is_empty() && tool_calls.is_none() {
+            return Err(ProviderError::ProviderBadResponse);
+        }
 
         let usage = parsed.usage.map(TokenUsage::from).unwrap_or_else(|| {
             let prompt_tokens = estimate_tokens_for_messages(&request.messages);
@@ -98,7 +112,7 @@ impl ChatProvider for AnthropicProvider {
 
         Ok(ChatCompletionResponse {
             id: openai_id("chatcmpl", Uuid::new_v4()),
-            object: "chat.completion",
+            object: "chat.completion".into(),
             created: 1_700_000_000,
             model: parsed.model,
             provider: self.name.clone(),
@@ -107,6 +121,8 @@ impl ChatProvider for AnthropicProvider {
                 message: ChatMessage {
                     role: ChatRole::Assistant,
                     content: completion_text,
+                    tool_calls,
+                    tool_call_id: None,
                 },
                 finish_reason: parsed.stop_reason.unwrap_or_else(|| "stop".to_string()),
             }],
@@ -123,6 +139,11 @@ impl ChatProvider for AnthropicProvider {
         let model = request.model.clone().unwrap_or_else(|| self.model.clone());
         let created = OffsetDateTime::now_utc().unix_timestamp();
         let response_id = Uuid::new_v4();
+        let tools = request.tools.as_deref().map(openai_tools_to_anthropic);
+        let tool_choice = request
+            .tool_choice
+            .as_ref()
+            .and_then(openai_tool_choice_to_anthropic);
         let outbound_request = AnthropicMessagesRequest {
             model: model.clone(),
             max_tokens: request.max_tokens.unwrap_or(512),
@@ -130,11 +151,17 @@ impl ChatProvider for AnthropicProvider {
             system,
             temperature: request.temperature,
             stream: Some(true),
+            tools,
+            tool_choice,
         };
+
+        let mut headers = HeaderMap::new();
+        crate::telemetry::tracing::inject_trace_context(&mut headers);
 
         let response = self
             .client
             .post(endpoint)
+            .headers(headers)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
             .json(&outbound_request)
@@ -155,6 +182,7 @@ impl ChatProvider for AnthropicProvider {
             let mut prompt_tokens = estimate_tokens_for_messages(&request.messages);
             let mut completion_tokens: Option<u32> = None;
             let mut emitted_role = false;
+            let mut tool_translator = AnthropicToolStreamTranslator::default();
 
             while let Some(bytes) = bytes_stream.next().await {
                 let chunk = bytes.map_err(map_transport_error)?;
@@ -177,6 +205,22 @@ impl ChatProvider for AnthropicProvider {
                             let Some(delta) = parsed.delta else {
                                 continue;
                             };
+                            if delta.kind == "input_json_delta" {
+                                if let Some(partial_json) = delta.partial_json {
+                                    if let Some(delta) = tool_translator.input_json_delta(partial_json) {
+                                        yield ProviderStreamEvent::Chunk(ChatCompletionChunkResponse::from_delta(
+                                            response_id,
+                                            created,
+                                            model_for_stream.clone(),
+                                            provider_name.clone(),
+                                            0,
+                                            delta,
+                                            None,
+                                        ));
+                                    }
+                                }
+                                continue;
+                            }
                             if delta.kind != "text_delta" {
                                 continue;
                             }
@@ -201,9 +245,25 @@ impl ChatProvider for AnthropicProvider {
                                         Some(ChatRole::Assistant)
                                     },
                                     content: Some(content),
+                                    tool_calls: None,
                                 },
                                 None,
                             ));
+                        }
+                        "content_block_start" => {
+                            if let (Some(index), Some(block)) = (parsed.index, parsed.content_block.as_ref()) {
+                                if let Some(delta) = tool_translator.content_block_start(index, block) {
+                                    yield ProviderStreamEvent::Chunk(ChatCompletionChunkResponse::from_delta(
+                                        response_id,
+                                        created,
+                                        model_for_stream.clone(),
+                                        provider_name.clone(),
+                                        0,
+                                        delta,
+                                        None,
+                                    ));
+                                }
+                            }
                         }
                         "message_delta" => {
                             if let Some(event_usage) = parsed.usage {
@@ -265,12 +325,16 @@ struct AnthropicMessagesRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<AnthropicToolChoice>,
 }
 
 #[derive(Debug, Serialize)]
 struct AnthropicMessage {
     role: &'static str,
-    content: String,
+    content: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,14 +345,6 @@ struct AnthropicMessagesResponse {
     usage: Option<AnthropicUsage>,
     #[serde(default)]
     stop_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicContentBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,6 +374,10 @@ struct AnthropicStreamEvent {
     delta: Option<AnthropicStreamDelta>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
+    #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
+    content_block: Option<AnthropicContentBlock>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +395,8 @@ struct AnthropicStreamDelta {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
+    partial_json: Option<String>,
+    #[serde(default)]
     stop_reason: Option<String>,
 }
 
@@ -347,15 +409,19 @@ fn split_system_messages(messages: Vec<ChatMessage>) -> (Option<String>, Vec<Ant
             ChatRole::Developer | ChatRole::System => system_messages.push(message.content),
             ChatRole::User => converted.push(AnthropicMessage {
                 role: "user",
-                content: message.content,
+                content: serde_json::Value::String(message.content),
             }),
             ChatRole::Assistant => converted.push(AnthropicMessage {
                 role: "assistant",
-                content: message.content,
+                content: serde_json::Value::String(message.content),
             }),
             ChatRole::Tool => converted.push(AnthropicMessage {
                 role: "user",
-                content: message.content,
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": message.tool_call_id.unwrap_or_default(),
+                    "content": message.content,
+                }]),
             }),
         }
     }
@@ -399,14 +465,20 @@ mod tests {
             ChatMessage {
                 role: ChatRole::System,
                 content: "First".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: ChatRole::User,
                 content: "Question".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: ChatRole::System,
                 content: "Second".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ]);
 

@@ -1,4 +1,6 @@
 pub mod app;
+pub mod auth;
+pub mod cache;
 pub mod compat;
 pub mod config;
 pub mod error;

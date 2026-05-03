@@ -20,10 +20,16 @@ fn request(model: &str) -> ChatCompletionRequest {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "Say hi".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
         }],
         temperature: Some(0.2),
         max_tokens: Some(64),
         stream: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        response_format: None,
     }
 }
 

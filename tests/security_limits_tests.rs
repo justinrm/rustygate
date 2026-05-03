@@ -82,6 +82,7 @@ async fn pre_auth_rate_limit_applies_to_invalid_bearer_attempts() {
         global_burst_size: 1,
         per_key_requests_per_minute: 120,
         per_key_burst_size: 60,
+        ..RateLimitConfig::default()
     });
     let app = app::router_with_state(state);
 
@@ -123,6 +124,7 @@ async fn rate_limit_returns_429_and_retry_after_header() {
         global_burst_size: 1,
         per_key_requests_per_minute: 120,
         per_key_burst_size: 60,
+        ..RateLimitConfig::default()
     });
     let app = app::router_with_state(state);
 
@@ -162,6 +164,7 @@ async fn valid_requests_still_use_per_key_rate_limit() {
         global_burst_size: 60,
         per_key_requests_per_minute: 1,
         per_key_burst_size: 1,
+        ..RateLimitConfig::default()
     });
     let app = app::router_with_state(state);
 
@@ -197,6 +200,7 @@ async fn rate_limit_refills_after_waiting_for_token_bucket() {
         global_burst_size: 1,
         per_key_requests_per_minute: 60,
         per_key_burst_size: 1,
+        ..RateLimitConfig::default()
     });
     let app = app::router_with_state(state);
 

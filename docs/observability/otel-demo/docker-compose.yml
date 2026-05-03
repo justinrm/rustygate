@@ -1,0 +1,21 @@
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  rustygate:
+    build:
+      context: ../../..
+    environment:
+      RUSTYGATE_CONFIG: examples/mock-config.toml
+      RUSTYGATE_GATEWAY_API_KEY: local-dev-gateway-key
+      RUSTYGATE_OTLP_ENDPOINT: http://jaeger:4317
+      RUST_LOG: rustygate=info,tower_http=info
+    depends_on:
+      - jaeger
+    ports:
+      - "8080:8080"

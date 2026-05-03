@@ -23,6 +23,11 @@ pub enum AppError {
         message: String,
         request_id: Option<Uuid>,
     },
+    #[error("forbidden")]
+    Forbidden {
+        message: String,
+        request_id: Option<Uuid>,
+    },
     #[error("request rate limited")]
     GatewayRateLimited {
         request_id: Option<Uuid>,
@@ -57,6 +62,7 @@ impl AppError {
         match self {
             Self::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::GatewayRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::NoProviderAvailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::ProviderRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -70,6 +76,7 @@ impl AppError {
         match self {
             Self::InvalidRequest { .. } => "invalid_request",
             Self::Unauthorized { .. } => "unauthorized",
+            Self::Forbidden { .. } => "forbidden",
             Self::GatewayRateLimited { .. } => "gateway_rate_limited",
             Self::NoProviderAvailable { .. } => "no_provider_available",
             Self::ProviderRateLimited { .. } => "provider_rate_limited",
@@ -83,6 +90,7 @@ impl AppError {
         match self {
             Self::InvalidRequest { request_id, .. }
             | Self::Unauthorized { request_id, .. }
+            | Self::Forbidden { request_id, .. }
             | Self::GatewayRateLimited { request_id, .. }
             | Self::NoProviderAvailable { request_id }
             | Self::ProviderRateLimited { request_id }
@@ -95,7 +103,7 @@ impl AppError {
     pub fn public_message(&self) -> String {
         match self {
             Self::InvalidRequest { message, .. } => message.clone(),
-            Self::Unauthorized { message, .. } => message.clone(),
+            Self::Unauthorized { message, .. } | Self::Forbidden { message, .. } => message.clone(),
             Self::GatewayRateLimited { .. } => "request rate limit exceeded, retry later".into(),
             Self::NoProviderAvailable { .. } => "no provider is available for this request".into(),
             Self::ProviderRateLimited { .. } => "provider rate limited this request".into(),

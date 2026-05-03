@@ -80,6 +80,28 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
         "counter",
         snapshot.estimated_total_cost_usd,
     );
+    write_metric(
+        &mut output,
+        "rustygate_cache_hit_ratio",
+        "Ratio of exact or semantic cache hits to cache hits plus misses.",
+        "gauge",
+        snapshot.cache_hit_ratio,
+    );
+
+    write_labeled_header(
+        &mut output,
+        "rustygate_cache_lookups_total",
+        "Response cache lookups by outcome.",
+        "counter",
+    );
+    for (outcome, count) in &snapshot.cache_lookups_by_outcome {
+        write_labeled_metric(
+            &mut output,
+            "rustygate_cache_lookups_total",
+            &[("outcome", outcome)],
+            *count as f64,
+        );
+    }
 
     write_labeled_header(
         &mut output,

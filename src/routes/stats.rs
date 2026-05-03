@@ -32,6 +32,8 @@ pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         estimated_output_cost_usd: snapshot.estimated_output_cost_usd,
         estimated_total_cost_usd: snapshot.estimated_total_cost_usd,
         request_errors_by_category: snapshot.request_errors_by_category,
+        cache_lookups_by_outcome: snapshot.cache_lookups_by_outcome,
+        cache_hit_ratio: snapshot.cache_hit_ratio,
     })
 }
 

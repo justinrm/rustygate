@@ -125,6 +125,8 @@ impl ResponseRequest {
                 messages.push(ChatMessage {
                     role: ChatRole::System,
                     content: instructions,
+                    tool_calls: None,
+                    tool_call_id: None,
                 });
             }
         }
@@ -133,6 +135,8 @@ impl ResponseRequest {
             ResponseInput::Text(text) => messages.push(ChatMessage {
                 role: ChatRole::User,
                 content: text,
+                tool_calls: None,
+                tool_call_id: None,
             }),
             ResponseInput::Messages(input_messages) => {
                 messages.extend(input_messages.into_iter().map(|message| ChatMessage {
@@ -144,6 +148,8 @@ impl ResponseRequest {
                         ResponseInputRole::Assistant => ChatRole::Assistant,
                     },
                     content: message.content.into_text(),
+                    tool_calls: None,
+                    tool_call_id: None,
                 }));
             }
         }
@@ -154,6 +160,10 @@ impl ResponseRequest {
             temperature: self.temperature,
             max_tokens: self.max_output_tokens,
             stream: self.stream,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            response_format: None,
         }
     }
 }
