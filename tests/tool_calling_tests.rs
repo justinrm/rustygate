@@ -1,29 +1,19 @@
-use std::sync::Arc;
-
-use axum::{
-    body::{to_bytes, Body},
-    http::{header, Request, StatusCode},
-};
+use axum::{body::to_bytes, http::StatusCode};
 use rustygate::{
     app::{self, AppState},
     models::chat::{ChatCompletionRequest, ToolChoice, ToolChoiceFunction},
-    providers::{
-        mock::MockProvider,
-        provider::{ProviderEntry, ProviderPricing},
-    },
 };
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-const TEST_GATEWAY_KEY: &str = "test-gateway-key";
+mod common;
+
+use common::{chat_request, mock_provider_entry};
 
 #[tokio::test]
 async fn mock_provider_returns_deterministic_tool_call() {
-    let state = AppState::from_providers(vec![ProviderEntry {
-        priority: 1,
-        provider: Arc::new(MockProvider::new("mock-primary", "mock-fast-v1")),
-        pricing: ProviderPricing::default(),
-    }]);
+    let state =
+        AppState::from_providers(vec![mock_provider_entry("mock-primary", "mock-fast-v1", 1)]);
 
     let response = app::router_with_state(state)
         .oneshot(chat_request(json!({
@@ -87,14 +77,4 @@ fn structured_tool_choice_deserializes_modes_and_functions() {
             ..
         }
     ));
-}
-
-fn chat_request(payload: Value) -> Request<Body> {
-    Request::builder()
-        .uri("/v1/chat/completions")
-        .method("POST")
-        .header("content-type", "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
-        .body(Body::from(payload.to_string()))
-        .unwrap()
 }

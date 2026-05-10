@@ -1,0 +1,93 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+shutdown_grace_period_ms = 10000
+
+[gateway]
+default_timeout_ms = 15000
+stream_idle_timeout_ms = 30000
+max_retries = 1
+enable_request_logging = false
+log_prompt_content = false
+api_key_env = "RUSTYGATE_GATEWAY_API_KEY"
+routing_policy = "priority"
+
+[gateway.route_exposure]
+placeholder_compat_routes = false
+
+[gateway.prefix_affinity]
+ttl_seconds = 300
+max_entries = 10000
+load_imbalance_threshold = 2
+fallback_policy = "latency"
+
+[gateway.retry]
+initial_backoff_ms = 25
+max_backoff_ms = 250
+jitter_ms = 0
+
+[gateway.circuit_breaker]
+failure_threshold = 3
+open_duration_ms = 5000
+half_open_max_probes = 1
+
+[gateway.rate_limit]
+global_requests_per_minute = 60000
+global_burst_size = 60000
+per_key_requests_per_minute = 60000
+per_key_burst_size = 60000
+
+[gateway.request_limits]
+max_chat_body_bytes = 262144
+max_messages_per_request = 64
+max_message_content_chars = 64000
+
+[gateway.admission]
+max_global_in_flight = 512
+max_estimated_prompt_tokens = 32768
+max_estimated_total_tokens = 49152
+retry_after_seconds = 1
+
+[storage]
+enabled = false
+database_url = "sqlite://rustygate-benchmark.db"
+
+[[providers]]
+name = "mock-replica-a"
+kind = "mock"
+model = "benchmark-mock-v1"
+priority = 1
+failure_rate = 0.0
+base_latency_ms = 0
+max_in_flight = 256
+cost_per_1k_input_tokens = 0.0001
+cost_per_1k_output_tokens = 0.0002
+
+[[providers]]
+name = "mock-replica-b"
+kind = "mock"
+model = "benchmark-mock-v1"
+priority = 2
+failure_rate = 0.0
+base_latency_ms = 0
+max_in_flight = 256
+cost_per_1k_input_tokens = 0.0001
+cost_per_1k_output_tokens = 0.0002
+
+[[providers]]
+name = "mock-replica-c"
+kind = "mock"
+model = "benchmark-mock-v1"
+priority = 3
+failure_rate = 0.0
+base_latency_ms = 0
+max_in_flight = 256
+cost_per_1k_input_tokens = 0.0001
+cost_per_1k_output_tokens = 0.0002
+
+[[model_pools]]
+name = "benchmark-mock-pool"
+aliases = ["benchmark-mock"]
+routing_policy = "priority"
+members = ["mock-replica-a", "mock-replica-b", "mock-replica-c"]
+max_in_flight = 512

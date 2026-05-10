@@ -37,7 +37,7 @@ async fn ready_detail_reports_per_provider_status() {
         provider: Arc::new(MockProvider::new("mock-primary", "mock-fast-v1")),
         pricing: ProviderPricing::default(),
     }]);
-    health::probe_once(&state).await;
+    health::probe_once(&state.providers, &state.provider_health).await;
 
     let response = app::router_with_state(state)
         .oneshot(
@@ -67,7 +67,7 @@ async fn ready_turns_503_when_all_providers_fail_health_checks() {
         }),
         pricing: ProviderPricing::default(),
     }]);
-    health::probe_once(&state).await;
+    health::probe_once(&state.providers, &state.provider_health).await;
 
     let response = app::router_with_state(state)
         .oneshot(

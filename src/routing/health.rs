@@ -8,8 +8,7 @@ use tokio::time::sleep;
 use tracing::warn;
 
 use crate::{
-    app::AppState,
-    providers::provider::ProviderError,
+    providers::provider::{ProviderEntry, ProviderError},
     routing::fallback::{provider_error_category, ProviderErrorCategory},
 };
 
@@ -99,28 +98,35 @@ impl ProviderHealthRegistry {
     }
 }
 
-pub fn spawn_provider_health_probes(state: AppState, interval: Duration) {
+pub fn spawn_provider_health_probes(
+    providers: Vec<ProviderEntry>,
+    provider_health: SharedProviderHealthRegistry,
+    interval: Duration,
+) {
     tokio::spawn(async move {
         loop {
-            probe_once(&state).await;
+            probe_once(&providers, &provider_health).await;
             sleep(interval).await;
         }
     });
 }
 
-pub async fn probe_once(state: &AppState) {
-    for entry in &state.providers {
+pub async fn probe_once(
+    providers: &[ProviderEntry],
+    provider_health: &SharedProviderHealthRegistry,
+) {
+    for entry in providers {
         let provider_name = entry.provider.name().to_string();
         let result = entry.provider.health_check().await;
         match result {
-            Ok(()) => state.provider_health.record_success(&provider_name),
+            Ok(()) => provider_health.record_success(&provider_name),
             Err(error) => {
                 warn!(
                     provider = provider_name,
                     error_category = provider_error_category(&error).as_str(),
                     "provider health check failed"
                 );
-                state.provider_health.record_failure(&provider_name, &error);
+                provider_health.record_failure(&provider_name, &error);
             }
         }
     }

@@ -6,12 +6,23 @@ shutdown_grace_period_ms = 15000
 [gateway]
 # Staging profile: real primary provider with a mock fallback for safe deploy checks.
 default_timeout_ms = 20000
+stream_idle_timeout_ms = 30000
 max_retries = 1
 enable_request_logging = true
 log_prompt_content = false
 api_key_env = "RUSTYGATE_GATEWAY_API_KEY"
 routing_policy = "priority"
 model_aliases = { "gpt-4o" = "gpt-4o-mini" }
+
+[gateway.route_exposure]
+# Staging exposes only real provider-backed inference/model routes by default.
+placeholder_compat_routes = false
+
+[gateway.prefix_affinity]
+ttl_seconds = 300
+max_entries = 10000
+load_imbalance_threshold = 2
+fallback_policy = "latency"
 
 [gateway.retry]
 initial_backoff_ms = 100
@@ -34,6 +45,12 @@ max_chat_body_bytes = 65536
 max_messages_per_request = 64
 max_message_content_chars = 8000
 
+[gateway.admission]
+max_global_in_flight = 64
+max_estimated_prompt_tokens = 8192
+max_estimated_total_tokens = 12288
+retry_after_seconds = 1
+
 [storage]
 enabled = true
 database_url = "sqlite:///data/rustygate-staging.db"
@@ -53,6 +70,7 @@ retry_jitter_ms = 50
 circuit_breaker_failure_threshold = 2
 circuit_breaker_open_duration_ms = 3000
 circuit_breaker_half_open_max_probes = 1
+max_in_flight = 32
 cost_per_1k_input_tokens = 0.00015
 cost_per_1k_output_tokens = 0.0006
 
@@ -63,5 +81,6 @@ model = "gpt-4o-mini"
 priority = 2
 failure_rate = 0.0
 base_latency_ms = 0
+max_in_flight = 16
 cost_per_1k_input_tokens = 0.0
 cost_per_1k_output_tokens = 0.0

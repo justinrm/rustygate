@@ -1,5 +1,5 @@
 {
-  "model": "mock-fast-v1",
+  "model": "benchmark-mock",
   "messages": [
     {
       "role": "user",

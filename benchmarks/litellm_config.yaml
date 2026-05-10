@@ -1,7 +1,7 @@
 model_list:
-  - model_name: mock-fast-v1
+  - model_name: benchmark-mock
     litellm_params:
-      model: openai/mock-fast-v1
+      model: openai/benchmark-mock
       api_base: http://rustygate:8080/v1
       api_key: benchmark-key
 

@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -14,6 +15,10 @@ use axum::{
 use futures_util::StreamExt;
 use rustygate::{
     app::{self, AppState},
+    config::{
+        AdmissionConfig, ModelPoolConfig, PrefixAffinityConfig, ProviderConfig, ProviderKind,
+        RoutingPolicy,
+    },
     models::chat::{
         ChatCompletionChunkResponse, ChatCompletionRequest, ChatCompletionResponse, ChatDelta,
         ChatRole,
@@ -25,16 +30,23 @@ use rustygate::{
             ProviderStreamContext, ProviderStreamEvent,
         },
     },
-    routing::resilience::{
-        CircuitBreakerPolicy, ProviderResiliencePolicy, ResilienceRegistry, RetryPolicy,
+    routing::{
+        admission::{AdmissionController, AdmissionLimits},
+        model_pools::ModelPoolIndex,
+        resilience::{
+            CircuitBreakerPolicy, ProviderResiliencePolicy, ResilienceRegistry, RetryPolicy,
+        },
     },
 };
 use serde_json::{json, Value};
 use time::OffsetDateTime;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const TEST_GATEWAY_KEY: &str = "test-gateway-key";
+
+mod common;
 
 #[tokio::test]
 async fn chat_completion_success_uses_mock_provider() {
@@ -113,6 +125,151 @@ async fn chat_completion_resolves_configured_model_alias() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["provider"], "mock-primary");
     assert_eq!(json["model"], "mock-fast-v1");
+}
+
+#[tokio::test]
+async fn chat_completion_routes_public_pool_model_to_pool_members() {
+    let mut state = AppState::from_providers(vec![
+        ProviderEntry {
+            priority: 2,
+            provider: Arc::new(MockProvider::new("replica-a", "internal-replica-a")),
+            pricing: ProviderPricing::default(),
+        },
+        ProviderEntry {
+            priority: 1,
+            provider: Arc::new(MockProvider::new("replica-b", "internal-replica-b")),
+            pricing: ProviderPricing::default(),
+        },
+    ]);
+    state.model_pools = Arc::new(ModelPoolIndex::from_configs(&[ModelPoolConfig {
+        name: "mock-fast-pool".to_string(),
+        aliases: vec!["mock-fast".to_string()],
+        routing_policy: None,
+        members: vec!["replica-a".to_string(), "replica-b".to_string()],
+        max_in_flight: None,
+    }]));
+
+    let response = app::router_with_state(state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast",
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["provider"], "replica-b");
+    assert_eq!(json["model"], "internal-replica-b");
+}
+
+#[tokio::test]
+async fn chat_completion_reuses_replica_for_repeated_prefix_affinity() {
+    let mut state = AppState::from_providers(vec![
+        ProviderEntry {
+            priority: 1,
+            provider: Arc::new(MockProvider::new("replica-a", "internal-replica-a")),
+            pricing: ProviderPricing::default(),
+        },
+        ProviderEntry {
+            priority: 2,
+            provider: Arc::new(MockProvider::new("replica-b", "internal-replica-b")),
+            pricing: ProviderPricing::default(),
+        },
+    ]);
+    state.routing_policy = RoutingPolicy::PrefixAffinity;
+    state.prefix_affinity = PrefixAffinityConfig {
+        ttl_seconds: 60,
+        max_entries: 100,
+        load_imbalance_threshold: 2,
+        fallback_policy: RoutingPolicy::Priority,
+    };
+    state.model_pools = Arc::new(ModelPoolIndex::from_configs(&[ModelPoolConfig {
+        name: "mock-fast-pool".to_string(),
+        aliases: vec!["mock-fast".to_string()],
+        routing_policy: Some(RoutingPolicy::PrefixAffinity),
+        members: vec!["replica-a".to_string(), "replica-b".to_string()],
+        max_in_flight: None,
+    }]));
+
+    let app = app::router_with_state(state);
+    let first = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast",
+            "messages": [
+                {"role": "system", "content": "You are a terse assistant for account summaries."},
+                {"role": "user", "content": "Summarize account A"}
+            ]
+        })))
+        .await
+        .unwrap();
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let first_json: Value = serde_json::from_slice(&first_body).unwrap();
+    let selected_provider = first_json["provider"].as_str().unwrap().to_string();
+
+    let second = app
+        .oneshot(chat_request(json!({
+            "model": "mock-fast",
+            "messages": [
+                {"role": "system", "content": "You are a terse assistant for account summaries."},
+                {"role": "user", "content": "Summarize account B"}
+            ]
+        })))
+        .await
+        .unwrap();
+    let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+    let second_json: Value = serde_json::from_slice(&second_body).unwrap();
+
+    assert_eq!(first_json["object"], "chat.completion");
+    assert_eq!(second_json["provider"], selected_provider);
+}
+
+#[tokio::test]
+async fn chat_completion_without_stable_prefix_uses_prefix_affinity_fallback_policy() {
+    let mut state = AppState::from_providers(vec![
+        ProviderEntry {
+            priority: 1,
+            provider: Arc::new(MockProvider::new("replica-a", "internal-replica-a")),
+            pricing: ProviderPricing::default(),
+        },
+        ProviderEntry {
+            priority: 2,
+            provider: Arc::new(MockProvider::new("replica-b", "internal-replica-b")),
+            pricing: ProviderPricing::default(),
+        },
+    ]);
+    state.routing_policy = RoutingPolicy::PrefixAffinity;
+    state.prefix_affinity = PrefixAffinityConfig {
+        ttl_seconds: 60,
+        max_entries: 100,
+        load_imbalance_threshold: 2,
+        fallback_policy: RoutingPolicy::Priority,
+    };
+    state.model_pools = Arc::new(ModelPoolIndex::from_configs(&[ModelPoolConfig {
+        name: "mock-fast-pool".to_string(),
+        aliases: vec!["mock-fast".to_string()],
+        routing_policy: Some(RoutingPolicy::PrefixAffinity),
+        members: vec!["replica-a".to_string(), "replica-b".to_string()],
+        max_in_flight: None,
+    }]));
+
+    let response = app::router_with_state(state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast",
+            "messages": [
+                {"role": "user", "content": "No reusable prefix here"}
+            ]
+        })))
+        .await
+        .unwrap();
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["provider"], "replica-a");
 }
 
 #[tokio::test]
@@ -426,6 +583,249 @@ async fn chat_completion_returns_503_when_no_provider_supports_requested_model()
 }
 
 #[tokio::test]
+async fn chat_completion_rejects_global_admission_limit_and_releases() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut state = AppState::from_providers(vec![blocking_entry(
+        "mock-primary",
+        "mock-fast-v1",
+        started.clone(),
+        release.clone(),
+    )]);
+    state.admission = admission_controller(
+        AdmissionConfig {
+            max_global_in_flight: Some(1),
+            retry_after_seconds: 2,
+            ..AdmissionConfig::default()
+        },
+        &[],
+        &[],
+    );
+
+    let app = app::router_with_state(state);
+    let first = tokio::spawn(app.clone().oneshot(chat_request(json!({
+        "model": "mock-fast-v1",
+        "messages": [
+            {"role": "user", "content": "Say hi"}
+        ]
+    }))));
+    started.notified().await;
+
+    let rejected = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [
+                {"role": "user", "content": "Say hi again"}
+            ]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        rejected
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    let body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "admission_rejected");
+
+    release.notify_one();
+    let first_response = first.await.unwrap().unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let after_release = tokio::spawn(app.clone().oneshot(chat_request(json!({
+        "model": "mock-fast-v1",
+        "messages": [
+            {"role": "user", "content": "Say hi after release"}
+        ]
+    }))));
+    started.notified().await;
+    release.notify_one();
+    assert_eq!(
+        after_release.await.unwrap().unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_pool_admission_limit() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let pool_config = ModelPoolConfig {
+        name: "mock-fast-pool".to_string(),
+        aliases: vec!["mock-fast".to_string()],
+        routing_policy: None,
+        members: vec!["replica-a".to_string()],
+        max_in_flight: Some(1),
+    };
+    let mut state = AppState::from_providers(vec![blocking_entry(
+        "replica-a",
+        "internal-replica-a",
+        started.clone(),
+        release.clone(),
+    )]);
+    state.model_pools = Arc::new(ModelPoolIndex::from_configs(std::slice::from_ref(
+        &pool_config,
+    )));
+    state.admission = admission_controller(AdmissionConfig::default(), &[], &[pool_config]);
+
+    let app = app::router_with_state(state);
+    let first = tokio::spawn(app.clone().oneshot(chat_request(json!({
+        "model": "mock-fast",
+        "messages": [
+            {"role": "user", "content": "Say hi"}
+        ]
+    }))));
+    started.notified().await;
+
+    let rejected = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast",
+            "messages": [
+                {"role": "user", "content": "Say hi again"}
+            ]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "admission_rejected");
+    assert_eq!(
+        json["error"]["message"],
+        "model pool in-flight limit exceeded"
+    );
+
+    release.notify_one();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_provider_admission_limit() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut state = AppState::from_providers(vec![blocking_entry(
+        "mock-primary",
+        "mock-fast-v1",
+        started.clone(),
+        release.clone(),
+    )]);
+    state.admission = admission_controller(
+        AdmissionConfig::default(),
+        &[provider_config("mock-primary", "mock-fast-v1", Some(1))],
+        &[],
+    );
+
+    let app = app::router_with_state(state);
+    let first = tokio::spawn(app.clone().oneshot(chat_request(json!({
+        "model": "mock-fast-v1",
+        "messages": [
+            {"role": "user", "content": "Say hi"}
+        ]
+    }))));
+    started.notified().await;
+
+    let rejected = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [
+                {"role": "user", "content": "Say hi again"}
+            ]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "admission_rejected");
+    assert_eq!(
+        json["error"]["message"],
+        "provider in-flight limit exceeded"
+    );
+
+    release.notify_one();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_estimated_token_budgets() {
+    let mut prompt_state = AppState::from_providers(vec![ProviderEntry {
+        priority: 1,
+        provider: Arc::new(MockProvider::new("mock-primary", "mock-fast-v1")),
+        pricing: ProviderPricing::default(),
+    }]);
+    prompt_state.admission = admission_controller(
+        AdmissionConfig {
+            max_estimated_prompt_tokens: Some(1),
+            ..AdmissionConfig::default()
+        },
+        &[],
+        &[],
+    );
+
+    let prompt_response = app::router_with_state(prompt_state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [
+                {"role": "user", "content": "two words"}
+            ]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(prompt_response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(prompt_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "invalid_request");
+    assert_eq!(
+        json["error"]["message"],
+        "estimated prompt token limit exceeded"
+    );
+
+    let mut total_state = AppState::from_providers(vec![ProviderEntry {
+        priority: 1,
+        provider: Arc::new(MockProvider::new("mock-primary", "mock-fast-v1")),
+        pricing: ProviderPricing::default(),
+    }]);
+    total_state.admission = admission_controller(
+        AdmissionConfig {
+            max_estimated_total_tokens: Some(3),
+            ..AdmissionConfig::default()
+        },
+        &[],
+        &[],
+    );
+
+    let total_response = app::router_with_state(total_state)
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "max_tokens": 3,
+            "messages": [
+                {"role": "user", "content": "one"}
+            ]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(total_response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(total_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "invalid_request");
+    assert_eq!(
+        json["error"]["message"],
+        "estimated total token limit exceeded"
+    );
+}
+
+#[tokio::test]
 async fn chat_completion_stops_on_non_retryable_provider_error() {
     let state = AppState::from_providers(vec![
         failing_entry(
@@ -473,6 +873,10 @@ async fn chat_completion_stops_on_non_retryable_provider_error() {
 
     assert_eq!(json["requests_by_provider"]["mock-primary"], 1);
     assert_eq!(json["requests_by_provider"]["mock-secondary"], Value::Null);
+    assert_eq!(
+        json["in_flight_requests_by_provider"]["mock-primary"],
+        Value::Null
+    );
 }
 
 #[tokio::test]
@@ -672,7 +1076,9 @@ async fn chat_completion_stream_returns_sse_chunks_and_done_marker() {
         pricing: ProviderPricing::default(),
     }]);
 
-    let response = app::router_with_state(state)
+    let app = app::router_with_state(state);
+    let response = app
+        .clone()
         .oneshot(chat_request(json!({
             "model": "mock-fast-v1",
             "stream": true,
@@ -697,6 +1103,32 @@ async fn chat_completion_stream_returns_sse_chunks_and_done_marker() {
     assert!(body_text.contains("chat.completion.chunk"));
     assert!(body_text.contains("mock-primary"));
     assert!(body_text.contains("[DONE]"));
+
+    let provider_stats_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/stats/providers")
+                .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let stats_body = to_bytes(provider_stats_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stats_json: Value = serde_json::from_slice(&stats_body).unwrap();
+    assert_eq!(
+        stats_json["in_flight_requests_by_provider"]["mock-primary"],
+        Value::Null
+    );
+    assert!(stats_json["p50_ttft_ms_by_provider"]["mock-primary"]
+        .as_f64()
+        .is_some());
+    assert!(stats_json["p95_ttft_ms_by_provider"]["mock-primary"]
+        .as_f64()
+        .is_some());
 }
 
 #[tokio::test]
@@ -719,7 +1151,9 @@ async fn chat_stream_falls_back_before_first_chunk() {
         },
     ]);
 
-    let response = app::router_with_state(state)
+    let app = app::router_with_state(state);
+    let response = app
+        .clone()
         .oneshot(chat_request(json!({
             "model": "mock-fast-v1",
             "stream": true,
@@ -735,6 +1169,30 @@ async fn chat_stream_falls_back_before_first_chunk() {
     let body_text = String::from_utf8(body.to_vec()).unwrap();
     assert!(body_text.contains("mock-secondary"));
     assert!(!body_text.contains("mock-primary"));
+
+    let provider_stats_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/stats/providers")
+                .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let stats_body = to_bytes(provider_stats_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stats_json: Value = serde_json::from_slice(&stats_body).unwrap();
+    assert_eq!(
+        stats_json["in_flight_requests_by_provider"]["mock-primary"],
+        Value::Null
+    );
+    assert_eq!(
+        stats_json["in_flight_requests_by_provider"]["mock-secondary"],
+        Value::Null
+    );
 }
 
 #[tokio::test]
@@ -771,8 +1229,123 @@ async fn chat_stream_emits_error_event_after_partial_output() {
     assert!(!body_text.contains("[DONE]"));
 }
 
+#[tokio::test]
+async fn chat_stream_times_out_when_provider_stalls_after_first_chunk() {
+    let mut state = AppState::from_providers(vec![stalling_stream_entry(
+        "stalling-stream",
+        "mock-fast-v1",
+    )]);
+    state.stream_idle_timeout = Duration::from_millis(20);
+    let app = app::router_with_state(state);
+
+    let response = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body_text.contains("chat.completion.chunk"));
+    assert!(body_text.contains("provider timed out while handling this request"));
+    assert!(!body_text.contains("[DONE]"));
+
+    let stats_response = app
+        .clone()
+        .oneshot(common::authenticated_get("/stats"))
+        .await
+        .unwrap();
+    let stats_body = to_bytes(stats_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stats_json: Value = serde_json::from_slice(&stats_body).unwrap();
+    assert_eq!(stats_json["request_errors_by_category"]["timeout"], 1);
+    assert_eq!(stats_json["stream_outcomes_by_outcome"]["idle_timeout"], 1);
+    assert_eq!(stats_json["in_flight_requests"], 0);
+
+    let provider_stats_response = app
+        .oneshot(common::authenticated_get("/stats/providers"))
+        .await
+        .unwrap();
+    let provider_stats_body = to_bytes(provider_stats_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let provider_stats_json: Value = serde_json::from_slice(&provider_stats_body).unwrap();
+    assert_eq!(
+        provider_stats_json["in_flight_requests_by_provider"]["stalling-stream"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn chat_stream_releases_guards_when_downstream_body_is_dropped() {
+    let provider_name = "cancel-stream";
+    let provider_config = provider_config(provider_name, "mock-fast-v1", Some(1));
+    let mut state =
+        AppState::from_providers(vec![stalling_stream_entry(provider_name, "mock-fast-v1")]);
+    state.admission = admission_controller(
+        AdmissionConfig {
+            max_global_in_flight: Some(1),
+            ..AdmissionConfig::default()
+        },
+        &[provider_config],
+        &[],
+    );
+    state.stream_idle_timeout = Duration::from_millis(1_000);
+    let app = app::router_with_state(state);
+
+    let response = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body_stream = response.into_body().into_data_stream();
+    let first_chunk = body_stream.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first_chunk).contains("chat.completion.chunk"));
+    drop(body_stream);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let follow_up = app
+        .clone()
+        .oneshot(chat_request(json!({
+            "model": "mock-fast-v1",
+            "messages": [
+                {"role": "user", "content": "Say hi"}
+            ]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(follow_up.status(), StatusCode::OK);
+
+    let stats_response = app
+        .oneshot(common::authenticated_get("/stats"))
+        .await
+        .unwrap();
+    let stats_body = to_bytes(stats_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stats_json: Value = serde_json::from_slice(&stats_body).unwrap();
+    assert_eq!(stats_json["in_flight_requests"], 0);
+    assert_eq!(stats_json["stream_outcomes_by_outcome"]["cancelled"], 1);
+}
+
 fn chat_request(body: Value) -> Request<Body> {
-    chat_request_raw(body.to_string())
+    common::chat_request(body)
 }
 
 fn chat_request_raw(body: impl Into<String>) -> Request<Body> {
@@ -794,6 +1367,183 @@ fn failing_entry(name: &str, model: &str, priority: u32, error: ProviderError) -
             error,
         }) as Arc<dyn ChatProvider>,
         pricing: ProviderPricing::default(),
+    }
+}
+
+fn blocking_entry(
+    name: &str,
+    model: &str,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+) -> ProviderEntry {
+    ProviderEntry {
+        priority: 1,
+        provider: Arc::new(BlockingProvider {
+            name: name.to_string(),
+            model: model.to_string(),
+            started,
+            release,
+        }) as Arc<dyn ChatProvider>,
+        pricing: ProviderPricing::default(),
+    }
+}
+
+fn stalling_stream_entry(name: &str, model: &str) -> ProviderEntry {
+    ProviderEntry {
+        priority: 1,
+        provider: Arc::new(StallingStreamProvider {
+            name: name.to_string(),
+            model: model.to_string(),
+        }) as Arc<dyn ChatProvider>,
+        pricing: ProviderPricing::default(),
+    }
+}
+
+fn admission_controller(
+    admission: AdmissionConfig,
+    providers: &[ProviderConfig],
+    model_pools: &[ModelPoolConfig],
+) -> Arc<AdmissionController> {
+    AdmissionController::new(AdmissionLimits::from_config(
+        &admission,
+        providers,
+        model_pools,
+    ))
+}
+
+fn provider_config(name: &str, model: &str, max_in_flight: Option<u64>) -> ProviderConfig {
+    ProviderConfig {
+        name: name.to_string(),
+        kind: ProviderKind::Mock,
+        model: model.to_string(),
+        priority: 1,
+        failure_rate: 0.0,
+        base_latency_ms: 0,
+        base_url: None,
+        api_key_env: None,
+        timeout_ms: None,
+        max_retries: None,
+        retry_initial_backoff_ms: None,
+        retry_max_backoff_ms: None,
+        retry_jitter_ms: None,
+        circuit_breaker_failure_threshold: None,
+        circuit_breaker_open_duration_ms: None,
+        circuit_breaker_half_open_max_probes: None,
+        max_in_flight,
+        cost_per_1k_input_tokens: 0.0,
+        cost_per_1k_output_tokens: 0.0,
+    }
+}
+
+#[derive(Debug)]
+struct BlockingProvider {
+    name: String,
+    model: String,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[derive(Debug)]
+struct StallingStreamProvider {
+    name: String,
+    model: String,
+}
+
+#[async_trait]
+impl ChatProvider for StallingStreamProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn supports_model(&self, model: &str) -> bool {
+        self.model == model
+    }
+
+    async fn chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Ok(ChatCompletionResponse::placeholder(
+            Uuid::new_v4(),
+            request.model.unwrap_or_else(|| self.model.clone()),
+            self.name.clone(),
+        ))
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError> {
+        let model = request.model.unwrap_or_else(|| self.model.clone());
+        let model_for_stream = model.clone();
+        let response_id = Uuid::new_v4();
+        let created = OffsetDateTime::now_utc().unix_timestamp();
+        let provider_name = self.name.clone();
+        let stream = async_stream::try_stream! {
+            yield ProviderStreamEvent::Chunk(ChatCompletionChunkResponse::from_delta(
+                response_id,
+                created,
+                model_for_stream,
+                provider_name,
+                0,
+                ChatDelta {
+                    role: Some(ChatRole::Assistant),
+                    content: Some("partial ".to_string()),
+                    tool_calls: None,
+                },
+                None,
+            ));
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+
+        Ok((
+            ProviderStreamContext {
+                response_id,
+                created,
+                model,
+            },
+            stream,
+        ))
+    }
+}
+
+#[async_trait]
+impl ChatProvider for BlockingProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn supports_model(&self, model: &str) -> bool {
+        self.model == model
+    }
+
+    async fn chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(ChatCompletionResponse::placeholder(
+            Uuid::new_v4(),
+            request.model.unwrap_or_else(|| self.model.clone()),
+            self.name.clone(),
+        ))
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: ChatCompletionRequest,
+    ) -> Result<(ProviderStreamContext, ProviderStream), ProviderError> {
+        Err(ProviderError::ProviderBadResponse)
     }
 }
 

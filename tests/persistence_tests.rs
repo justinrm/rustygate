@@ -1,9 +1,6 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
-use axum::{
-    body::{to_bytes, Body},
-    http::{header, Request, StatusCode},
-};
+use axum::{body::to_bytes, http::StatusCode};
 use rustygate::{
     app::{self, AppState},
     providers::{
@@ -16,7 +13,9 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const TEST_GATEWAY_KEY: &str = "test-gateway-key";
+mod common;
+
+use common::{authenticated_get, chat_request, mock_provider_entry};
 
 #[tokio::test]
 async fn sqlite_persists_successful_request_without_prompt_content() {
@@ -49,17 +48,7 @@ async fn sqlite_persists_successful_request_without_prompt_content() {
     assert_eq!(store.count_provider_attempts().await.unwrap(), 1);
     assert_eq!(store.count_logs_with_prompt_content().await.unwrap(), 0);
 
-    let stats_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/stats")
-                .method("GET")
-                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let stats_response = app.oneshot(authenticated_get("/stats")).await.unwrap();
     assert_eq!(stats_response.status(), StatusCode::OK);
     let body = to_bytes(stats_response.into_body(), usize::MAX)
         .await
@@ -92,11 +81,7 @@ async fn sqlite_persists_fallback_provider_attempts() {
             }),
             pricing: ProviderPricing::default(),
         },
-        ProviderEntry {
-            priority: 2,
-            provider: Arc::new(MockProvider::new("mock-secondary", "mock-fast-v1")),
-            pricing: ProviderPricing::default(),
-        },
+        mock_provider_entry("mock-secondary", "mock-fast-v1", 2),
     ])
     .with_request_log_store(store.clone());
 
@@ -117,14 +102,7 @@ async fn sqlite_persists_fallback_provider_attempts() {
     assert_eq!(store.count_provider_attempts().await.unwrap(), 2);
 
     let provider_stats_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/stats/providers")
-                .method("GET")
-                .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_get("/stats/providers"))
         .await
         .unwrap();
     assert_eq!(provider_stats_response.status(), StatusCode::OK);
@@ -140,16 +118,6 @@ async fn sqlite_persists_fallback_provider_attempts() {
     assert_eq!(stats["fallback_attempts_by_provider"]["mock-secondary"], 1);
 
     let _ = fs::remove_file(database_path);
-}
-
-fn chat_request(body: Value) -> Request<Body> {
-    Request::builder()
-        .uri("/v1/chat/completions")
-        .method("POST")
-        .header("content-type", "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
-        .body(Body::from(body.to_string()))
-        .unwrap()
 }
 
 async fn temp_store() -> (SqliteRequestLogStore, PathBuf) {

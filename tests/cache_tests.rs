@@ -1,29 +1,22 @@
 use std::{sync::Arc, time::Duration};
 
-use axum::{
-    body::Body,
-    http::{header, Request, StatusCode},
-};
+use axum::http::StatusCode;
 use rustygate::{
     app::{self, AppState},
-    cache::response::MemoryResponseCache,
-    providers::{
-        mock::MockProvider,
-        provider::{ProviderEntry, ProviderPricing},
-    },
+    cache::response::{cache_key_for_request, MemoryResponseCache},
+    models::chat::{ChatCompletionRequest, ChatMessage, ChatRole},
 };
-use serde_json::{json, Value};
+use serde_json::json;
 use tower::ServiceExt;
 
-const TEST_GATEWAY_KEY: &str = "test-gateway-key";
+mod common;
+
+use common::{chat_request, mock_provider_entry};
 
 #[tokio::test]
 async fn identical_non_streaming_request_hits_response_cache() {
-    let mut state = AppState::from_providers(vec![ProviderEntry {
-        priority: 1,
-        provider: Arc::new(MockProvider::new("mock-primary", "mock-fast-v1")),
-        pricing: ProviderPricing::default(),
-    }]);
+    let mut state =
+        AppState::from_providers(vec![mock_provider_entry("mock-primary", "mock-fast-v1", 1)]);
     state.response_cache = Some(Arc::new(MemoryResponseCache::new(
         Duration::from_secs(60),
         100,
@@ -50,11 +43,8 @@ async fn identical_non_streaming_request_hits_response_cache() {
 
 #[tokio::test]
 async fn temperature_above_zero_skips_cache() {
-    let mut state = AppState::from_providers(vec![ProviderEntry {
-        priority: 1,
-        provider: Arc::new(MockProvider::new("mock-primary", "mock-fast-v1")),
-        pricing: ProviderPricing::default(),
-    }]);
+    let mut state =
+        AppState::from_providers(vec![mock_provider_entry("mock-primary", "mock-fast-v1", 1)]);
     state.response_cache = Some(Arc::new(MemoryResponseCache::new(
         Duration::from_secs(60),
         100,
@@ -72,12 +62,28 @@ async fn temperature_above_zero_skips_cache() {
     assert_eq!(response.headers().get("x-rustygate-cache").unwrap(), "MISS");
 }
 
-fn chat_request(payload: Value) -> Request<Body> {
-    Request::builder()
-        .uri("/v1/chat/completions")
-        .method("POST")
-        .header("content-type", "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
-        .body(Body::from(payload.to_string()))
-        .unwrap()
+#[test]
+fn cache_key_metadata_does_not_include_prompt_text() {
+    let prompt = "secret prompt text should not appear in cache metadata";
+    let request = ChatCompletionRequest {
+        model: Some("mock-fast-v1".into()),
+        messages: vec![ChatMessage {
+            role: ChatRole::System,
+            content: prompt.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        temperature: Some(0.0),
+        max_tokens: None,
+        stream: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        response_format: None,
+    };
+
+    let cache_key = cache_key_for_request(&request).expect("cacheable request");
+
+    assert!(!cache_key.as_str().contains(prompt));
+    assert_eq!(cache_key.as_str().len(), 64);
 }

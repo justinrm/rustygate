@@ -1,0 +1,6 @@
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Write a short benchmark response about synthetic customer support routing."}],"temperature":0,"max_tokens":64}
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Write a short benchmark response about nightly warehouse reconciliation."}],"temperature":0,"max_tokens":64}
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Write a short benchmark response about feature flag rollout safety."}],"temperature":0,"max_tokens":64}
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Write a short benchmark response about status page incident wording."}],"temperature":0,"max_tokens":64}
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Write a short benchmark response about retry backoff in a queue worker."}],"temperature":0,"max_tokens":64}
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Write a short benchmark response about compact API documentation."}],"temperature":0,"max_tokens":64}

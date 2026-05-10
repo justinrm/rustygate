@@ -102,7 +102,7 @@ pub struct ToolCallFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
     Developer,

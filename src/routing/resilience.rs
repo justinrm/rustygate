@@ -11,6 +11,16 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+impl CircuitState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half_open",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     pub max_retries: u32,

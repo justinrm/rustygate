@@ -33,6 +33,26 @@ fn request(model: &str) -> ChatCompletionRequest {
     }
 }
 
+fn openai_provider(base_url: String) -> OpenAiCompatibleProvider {
+    OpenAiCompatibleProvider {
+        name: "openai-primary".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        base_url,
+        api_key: "test-key".to_string(),
+        client: Client::new(),
+    }
+}
+
+fn anthropic_provider(base_url: String) -> AnthropicProvider {
+    AnthropicProvider {
+        name: "anthropic-primary".to_string(),
+        model: "claude-3-5-sonnet-latest".to_string(),
+        base_url,
+        api_key: "anthropic-key".to_string(),
+        client: Client::new(),
+    }
+}
+
 #[tokio::test]
 async fn openai_provider_maps_successful_response() {
     let server = MockServer::start().await;
@@ -55,13 +75,7 @@ async fn openai_provider_maps_successful_response() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiCompatibleProvider {
-        name: "openai-primary".to_string(),
-        model: "gpt-4o-mini".to_string(),
-        base_url: server.uri(),
-        api_key: "test-key".to_string(),
-        client: Client::new(),
-    };
+    let provider = openai_provider(server.uri());
     let response = provider
         .chat_completion(request("gpt-4o-mini"))
         .await
@@ -82,13 +96,7 @@ async fn openai_provider_maps_rate_limit_response() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiCompatibleProvider {
-        name: "openai-primary".to_string(),
-        model: "gpt-4o-mini".to_string(),
-        base_url: server.uri(),
-        api_key: "test-key".to_string(),
-        client: Client::new(),
-    };
+    let provider = openai_provider(server.uri());
     let error = provider
         .chat_completion(request("gpt-4o-mini"))
         .await
@@ -117,13 +125,7 @@ async fn anthropic_provider_maps_successful_response() {
         .mount(&server)
         .await;
 
-    let provider = AnthropicProvider {
-        name: "anthropic-primary".to_string(),
-        model: "claude-3-5-sonnet-latest".to_string(),
-        base_url: server.uri(),
-        api_key: "anthropic-key".to_string(),
-        client: Client::new(),
-    };
+    let provider = anthropic_provider(server.uri());
     let response = provider
         .chat_completion(request("claude-3-5-sonnet-latest"))
         .await
@@ -145,13 +147,7 @@ async fn anthropic_provider_maps_auth_failure() {
         .mount(&server)
         .await;
 
-    let provider = AnthropicProvider {
-        name: "anthropic-primary".to_string(),
-        model: "claude-3-5-sonnet-latest".to_string(),
-        base_url: server.uri(),
-        api_key: "anthropic-key".to_string(),
-        client: Client::new(),
-    };
+    let provider = anthropic_provider(server.uri());
     let error = provider
         .chat_completion(request("claude-3-5-sonnet-latest"))
         .await
@@ -178,13 +174,7 @@ async fn openai_provider_streams_incremental_chunks() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiCompatibleProvider {
-        name: "openai-primary".to_string(),
-        model: "gpt-4o-mini".to_string(),
-        base_url: server.uri(),
-        api_key: "test-key".to_string(),
-        client: Client::new(),
-    };
+    let provider = openai_provider(server.uri());
 
     let (_context, mut stream) = provider
         .chat_completion_stream(ChatCompletionRequest {
@@ -228,13 +218,7 @@ async fn openai_provider_rejects_oversized_sse_events() {
         .mount(&server)
         .await;
 
-    let provider = OpenAiCompatibleProvider {
-        name: "openai-primary".to_string(),
-        model: "gpt-4o-mini".to_string(),
-        base_url: server.uri(),
-        api_key: "test-key".to_string(),
-        client: Client::new(),
-    };
+    let provider = openai_provider(server.uri());
 
     let (_context, mut stream) = provider
         .chat_completion_stream(ChatCompletionRequest {
@@ -272,13 +256,7 @@ async fn anthropic_provider_streams_incremental_chunks() {
         .mount(&server)
         .await;
 
-    let provider = AnthropicProvider {
-        name: "anthropic-primary".to_string(),
-        model: "claude-3-5-sonnet-latest".to_string(),
-        base_url: server.uri(),
-        api_key: "anthropic-key".to_string(),
-        client: Client::new(),
-    };
+    let provider = anthropic_provider(server.uri());
 
     let (_context, mut stream) = provider
         .chat_completion_stream(ChatCompletionRequest {

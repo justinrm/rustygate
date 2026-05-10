@@ -6,6 +6,8 @@ shutdown_grace_period_ms = 10000
 [gateway]
 # Default timeout for outbound HTTP calls in real providers.
 default_timeout_ms = 15000
+# Maximum idle gap between streamed provider chunks before RustyGate ends the stream.
+stream_idle_timeout_ms = 30000
 # Number of retries to attempt on the same provider before fallback.
 max_retries = 1
 # Emits structured request metadata without prompt content.
@@ -13,8 +15,20 @@ enable_request_logging = true
 # Local development only: stores prompt messages in request logs when true.
 log_prompt_content = false
 api_key_env = "RUSTYGATE_GATEWAY_API_KEY"
-routing_policy = "priority"
-model_aliases = { "mock-fast" = "mock-fast-v1" }
+# Prefix affinity is active here so the examples directory has a minimal v0.4 pool config.
+routing_policy = "prefix_affinity"
+model_aliases = { "mock-fast" = "mock-fast-pool" }
+
+[gateway.route_exposure]
+# Mock examples keep placeholder compatibility endpoints enabled.
+placeholder_compat_routes = true
+
+[gateway.prefix_affinity]
+# Used only when routing_policy or a model-pool override is "prefix_affinity".
+ttl_seconds = 300
+max_entries = 10000
+load_imbalance_threshold = 2
+fallback_policy = "latency"
 
 [gateway.retry]
 initial_backoff_ms = 100
@@ -25,6 +39,18 @@ jitter_ms = 20
 failure_threshold = 3
 open_duration_ms = 5000
 half_open_max_probes = 1
+
+[gateway.rate_limit]
+global_requests_per_minute = 240
+global_burst_size = 60
+per_key_requests_per_minute = 120
+per_key_burst_size = 30
+
+[gateway.admission]
+max_global_in_flight = 32
+max_estimated_prompt_tokens = 8192
+max_estimated_total_tokens = 12288
+retry_after_seconds = 1
 
 [storage]
 # Optional SQLite request log persistence. In-memory metrics remain the default when disabled.
@@ -40,6 +66,7 @@ priority = 1
 failure_rate = 0.0
 # Reserved for future latency simulation.
 base_latency_ms = 0
+max_in_flight = 16
 cost_per_1k_input_tokens = 0.0001
 cost_per_1k_output_tokens = 0.0002
 
@@ -50,5 +77,13 @@ model = "mock-fast-v1"
 priority = 2
 failure_rate = 0.0
 base_latency_ms = 0
+max_in_flight = 16
 cost_per_1k_input_tokens = 0.00008
 cost_per_1k_output_tokens = 0.00015
+
+[[model_pools]]
+name = "mock-fast-pool"
+aliases = ["mock-fast-ha"]
+routing_policy = "prefix_affinity"
+members = ["mock-low-latency", "mock-backup"]
+max_in_flight = 24

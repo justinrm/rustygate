@@ -3,21 +3,34 @@
 //! Keep fallback logic separate from HTTP handlers so it can be unit tested without binding a
 //! server or making network calls.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use futures_util::StreamExt;
 use tokio::time::sleep;
 use tracing::{field, Instrument};
 
 use crate::{
-    config::RoutingPolicy,
+    config::{PrefixAffinityConfig, RoutingPolicy},
     models::chat::{ChatCompletionRequest, ChatCompletionResponse},
     providers::provider::{
         CostEstimate, ProviderEntry, ProviderError, ProviderPricing, ProviderStream,
         ProviderStreamContext, ProviderStreamEvent,
     },
-    routing::{resilience::ResilienceRegistry, strategy},
-    telemetry::metrics::MetricsSnapshot,
+    routing::{
+        admission::{AdmissionController, AdmissionGuard, AdmissionRejection},
+        model_pools::ModelPoolIndex,
+        prefix_affinity::PrefixAffinityIndex,
+        prefix_fingerprint::{fingerprint_request, PrefixFingerprintResult},
+        resilience::ResilienceRegistry,
+        strategy,
+    },
+    telemetry::{
+        metrics::{MetricsRegistry, MetricsSnapshot, ProviderInFlightGuard, ProviderLoadEstimate},
+        token_estimator::estimate_tokens_for_messages,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,30 +86,65 @@ pub struct StreamingFallbackSuccess {
     pub provider_name: String,
     pub pricing: ProviderPricing,
     pub attempts: Vec<ProviderAttempt>,
+    pub in_flight_guard: ProviderInFlightGuard,
+    pub admission_guard: AdmissionGuard,
 }
 
 #[derive(Debug, Clone)]
 pub enum FallbackError {
     NoProviderAvailable,
+    AdmissionRejected(AdmissionRejection),
     ProviderFailed {
         error: ProviderError,
         attempts: Vec<ProviderAttempt>,
     },
 }
 
+pub struct FallbackContext<'a> {
+    pub providers: &'a [ProviderEntry],
+    pub model_pools: &'a ModelPoolIndex,
+    pub resilience: &'a ResilienceRegistry,
+    pub routing_policy: RoutingPolicy,
+    pub prefix_affinity: &'a PrefixAffinityConfig,
+    pub prefix_affinity_index: &'a PrefixAffinityIndex,
+    pub metrics_snapshot: Option<&'a MetricsSnapshot>,
+    pub metrics: Arc<Mutex<MetricsRegistry>>,
+    pub admission: Arc<AdmissionController>,
+}
+
 pub async fn complete_chat(
-    providers: &[ProviderEntry],
-    resilience: &ResilienceRegistry,
+    context: FallbackContext<'_>,
     request: ChatCompletionRequest,
-    routing_policy: RoutingPolicy,
-    metrics_snapshot: Option<&MetricsSnapshot>,
 ) -> Result<FallbackSuccess, FallbackError> {
-    let candidates = strategy::candidate_providers(
+    let FallbackContext {
+        providers,
+        model_pools,
+        resilience,
+        routing_policy,
+        prefix_affinity,
+        prefix_affinity_index,
+        metrics_snapshot,
+        metrics,
+        admission,
+    } = context;
+    let prefix_fingerprint = fingerprint_request(&request);
+    record_prefix_fingerprint(metrics.as_ref(), &prefix_fingerprint);
+    let selection = strategy::candidate_providers_with_affinity(
         providers,
         request.model.as_deref(),
         routing_policy,
         metrics_snapshot,
+        model_pools,
+        Some(resilience),
+        Some(strategy::PrefixAffinityRouting {
+            index: prefix_affinity_index,
+            config: prefix_affinity,
+            fingerprint: &prefix_fingerprint,
+        }),
     );
+    let candidates = selection.candidates;
+    let effective_policy = selection.effective_policy;
+    record_routing_decision(metrics.as_ref(), effective_policy, selection.reason);
 
     if candidates.is_empty() {
         return Err(FallbackError::NoProviderAvailable);
@@ -104,14 +152,26 @@ pub async fn complete_chat(
 
     let mut attempts = Vec::new();
     let mut attempt_order = 0_u32;
+    let mut admission_rejection = None;
 
     for (index, entry) in candidates.iter().enumerate() {
         let provider_name = entry.provider.name().to_string();
         if !resilience.allow_provider_call(&provider_name) {
+            record_routing_decision(metrics.as_ref(), effective_policy, "circuit_open");
             continue;
         }
+        let provider_admission_guard = match admission.try_acquire_provider(&provider_name) {
+            Ok(guard) => guard,
+            Err(rejection) => {
+                admission_rejection = Some(rejection);
+                continue;
+            }
+        };
         let retry_policy = resilience.policy_for(&provider_name).retry;
         let is_fallback = index > 0;
+        if is_fallback {
+            record_routing_decision(metrics.as_ref(), effective_policy, "fallback");
+        }
         let mut last_retryable_error = None;
 
         for retry_attempt in 0..=retry_policy.max_retries {
@@ -130,9 +190,15 @@ pub async fn complete_chat(
                 "error.type" = field::Empty,
             );
             let started = Instant::now();
+            let _in_flight_guard = ProviderInFlightGuard::new(
+                metrics.clone(),
+                provider_name.clone(),
+                provider_load_estimate(&request),
+            );
+            let _provider_admission_guard = &provider_admission_guard;
             let result = entry
                 .provider
-                .chat_completion(request.clone())
+                .chat_completion(request_for_provider(&request, entry.provider.model()))
                 .instrument(attempt_span.clone())
                 .await;
             let latency_ms = started.elapsed().as_millis() as u64;
@@ -155,6 +221,13 @@ pub async fn complete_chat(
                         error_category: None,
                     });
                     resilience.record_success(&provider_name);
+                    record_routing_decision(metrics.as_ref(), effective_policy, "selected");
+                    record_prefix_affinity_selection(
+                        prefix_affinity_index,
+                        &prefix_fingerprint,
+                        &provider_name,
+                        effective_policy,
+                    );
                     let cost_estimate = entry.pricing.estimate_cost(
                         response.usage.prompt_tokens,
                         response.usage.completion_tokens,
@@ -207,36 +280,72 @@ pub async fn complete_chat(
         }
     }
 
-    Err(FallbackError::NoProviderAvailable)
+    if let Some(rejection) = admission_rejection {
+        Err(FallbackError::AdmissionRejected(rejection))
+    } else {
+        Err(FallbackError::NoProviderAvailable)
+    }
 }
 
 pub async fn complete_chat_stream(
-    providers: &[ProviderEntry],
-    resilience: &ResilienceRegistry,
+    context: FallbackContext<'_>,
     request: ChatCompletionRequest,
-    routing_policy: RoutingPolicy,
-    metrics_snapshot: Option<&MetricsSnapshot>,
 ) -> Result<StreamingFallbackSuccess, FallbackError> {
-    let candidates = strategy::candidate_providers(
+    let FallbackContext {
+        providers,
+        model_pools,
+        resilience,
+        routing_policy,
+        prefix_affinity,
+        prefix_affinity_index,
+        metrics_snapshot,
+        metrics,
+        admission,
+    } = context;
+    let prefix_fingerprint = fingerprint_request(&request);
+    record_prefix_fingerprint(metrics.as_ref(), &prefix_fingerprint);
+    let selection = strategy::candidate_providers_with_affinity(
         providers,
         request.model.as_deref(),
         routing_policy,
         metrics_snapshot,
+        model_pools,
+        Some(resilience),
+        Some(strategy::PrefixAffinityRouting {
+            index: prefix_affinity_index,
+            config: prefix_affinity,
+            fingerprint: &prefix_fingerprint,
+        }),
     );
+    let candidates = selection.candidates;
+    let effective_policy = selection.effective_policy;
+    record_routing_decision(metrics.as_ref(), effective_policy, selection.reason);
     if candidates.is_empty() {
         return Err(FallbackError::NoProviderAvailable);
     }
 
     let mut attempts = Vec::new();
     let mut attempt_order = 0_u32;
+    let mut admission_rejection = None;
 
     for (index, entry) in candidates.iter().enumerate() {
         let provider_name = entry.provider.name().to_string();
         if !resilience.allow_provider_call(&provider_name) {
+            record_routing_decision(metrics.as_ref(), effective_policy, "circuit_open");
             continue;
         }
+        let provider_admission_guard = match admission.try_acquire_provider(&provider_name) {
+            Ok(guard) => guard,
+            Err(rejection) => {
+                admission_rejection = Some(rejection);
+                continue;
+            }
+        };
         let retry_policy = resilience.policy_for(&provider_name).retry;
         let is_fallback = index > 0;
+        if is_fallback {
+            record_routing_decision(metrics.as_ref(), effective_policy, "fallback");
+        }
         let mut last_retryable_error = None;
 
         for retry_attempt in 0..=retry_policy.max_retries {
@@ -253,9 +362,14 @@ pub async fn complete_chat_stream(
                 "error.type" = field::Empty,
             );
             let started = Instant::now();
+            let in_flight_guard = ProviderInFlightGuard::new(
+                metrics.clone(),
+                provider_name.clone(),
+                provider_load_estimate(&request),
+            );
             let result = entry
                 .provider
-                .chat_completion_stream(request.clone())
+                .chat_completion_stream(request_for_provider(&request, entry.provider.model()))
                 .instrument(attempt_span.clone())
                 .await;
 
@@ -268,6 +382,9 @@ pub async fn complete_chat_stream(
 
                     match first_event_result {
                         Some(Ok(first_event)) => {
+                            if let Ok(mut metrics) = metrics.lock() {
+                                metrics.record_provider_ttft(&provider_name, latency_ms);
+                            }
                             attempts.push(ProviderAttempt {
                                 provider_name: provider_name.clone(),
                                 attempt_order,
@@ -277,6 +394,13 @@ pub async fn complete_chat_stream(
                                 error_category: None,
                             });
                             resilience.record_success(&provider_name);
+                            record_routing_decision(metrics.as_ref(), effective_policy, "selected");
+                            record_prefix_affinity_selection(
+                                prefix_affinity_index,
+                                &prefix_fingerprint,
+                                &provider_name,
+                                effective_policy,
+                            );
                             return Ok(StreamingFallbackSuccess {
                                 context,
                                 first_event,
@@ -284,6 +408,8 @@ pub async fn complete_chat_stream(
                                 provider_name,
                                 pricing: entry.pricing,
                                 attempts,
+                                in_flight_guard,
+                                admission_guard: provider_admission_guard,
                             });
                         }
                         Some(Err(error)) => {
@@ -373,7 +499,11 @@ pub async fn complete_chat_stream(
         }
     }
 
-    Err(FallbackError::NoProviderAvailable)
+    if let Some(rejection) = admission_rejection {
+        Err(FallbackError::AdmissionRejected(rejection))
+    } else {
+        Err(FallbackError::NoProviderAvailable)
+    }
 }
 
 fn retry_backoff(
@@ -417,5 +547,59 @@ pub fn provider_error_category(error: &ProviderError) -> ProviderErrorCategory {
         ProviderError::AuthenticationFailed => ProviderErrorCategory::AuthenticationFailed,
         ProviderError::ProviderUnavailable => ProviderErrorCategory::ProviderUnavailable,
         ProviderError::ProviderBadResponse => ProviderErrorCategory::ProviderBadResponse,
+    }
+}
+
+fn request_for_provider(
+    request: &ChatCompletionRequest,
+    provider_model: &str,
+) -> ChatCompletionRequest {
+    let mut request = request.clone();
+    request.model = Some(provider_model.to_string());
+    request
+}
+
+fn provider_load_estimate(request: &ChatCompletionRequest) -> ProviderLoadEstimate {
+    ProviderLoadEstimate {
+        prompt_tokens: estimate_tokens_for_messages(&request.messages),
+        max_completion_tokens: request.max_tokens,
+    }
+}
+
+fn record_routing_decision(
+    metrics: &Mutex<MetricsRegistry>,
+    policy: RoutingPolicy,
+    reason: &'static str,
+) {
+    if let Ok(mut metrics) = metrics.lock() {
+        metrics.record_routing_decision(policy.as_str(), reason);
+    }
+}
+
+fn record_prefix_fingerprint(
+    metrics: &Mutex<MetricsRegistry>,
+    fingerprint: &PrefixFingerprintResult,
+) {
+    let outcome = if fingerprint.is_high_confidence() {
+        "hit"
+    } else {
+        "miss"
+    };
+
+    if let Ok(mut metrics) = metrics.lock() {
+        metrics.record_prefix_fingerprint(outcome);
+    }
+}
+
+fn record_prefix_affinity_selection(
+    index: &PrefixAffinityIndex,
+    fingerprint: &PrefixFingerprintResult,
+    provider_name: &str,
+    effective_policy: RoutingPolicy,
+) {
+    if effective_policy == RoutingPolicy::PrefixAffinity && fingerprint.is_high_confidence() {
+        if let Some(fingerprint) = fingerprint.fingerprint.as_deref() {
+            index.record(fingerprint, provider_name);
+        }
     }
 }

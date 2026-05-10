@@ -48,6 +48,7 @@ impl RequestLogStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RequestErrorCategory {
     InvalidRequest,
+    AdmissionRejected,
     NoProviderAvailable,
     Timeout,
     RateLimited,
@@ -60,6 +61,7 @@ impl RequestErrorCategory {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
+            Self::AdmissionRejected => "admission_rejected",
             Self::NoProviderAvailable => "no_provider_available",
             Self::Timeout => "timeout",
             Self::RateLimited => "rate_limited",

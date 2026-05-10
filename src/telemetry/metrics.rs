@@ -3,13 +3,132 @@
 //! Keep the MVP simple: aggregate counters, latency samples, provider counts, token estimates, and
 //! cost estimates in memory. Add bounded storage before keeping recent request details.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use crate::{
     models::chat::TokenUsage, providers::provider::CostEstimate, routing::fallback::ProviderAttempt,
 };
 
 const MAX_LATENCY_SAMPLES: usize = 1_024;
+const MAX_ERROR_SAMPLES: usize = 1_024;
+const QUEUE_PRESSURE_TOKEN_UNIT: u32 = 1_024;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderLoadEstimate {
+    pub prompt_tokens: u32,
+    pub max_completion_tokens: Option<u32>,
+}
+
+impl ProviderLoadEstimate {
+    fn queue_pressure_units(self) -> u64 {
+        let estimated_tokens = self
+            .prompt_tokens
+            .saturating_add(self.max_completion_tokens.unwrap_or_default());
+        1 + u64::from(estimated_tokens.div_ceil(QUEUE_PRESSURE_TOKEN_UNIT))
+    }
+}
+
+#[derive(Debug)]
+pub struct ProviderInFlightGuard {
+    metrics: Arc<Mutex<MetricsRegistry>>,
+    provider_name: String,
+    queue_pressure_units: u64,
+    active: bool,
+}
+
+impl ProviderInFlightGuard {
+    pub fn new(
+        metrics: Arc<Mutex<MetricsRegistry>>,
+        provider_name: impl Into<String>,
+        load_estimate: ProviderLoadEstimate,
+    ) -> Self {
+        let provider_name = provider_name.into();
+        let queue_pressure_units = load_estimate.queue_pressure_units();
+        if let Ok(mut metrics) = metrics.lock() {
+            metrics.begin_provider_request(&provider_name, queue_pressure_units);
+        }
+
+        Self {
+            metrics,
+            provider_name,
+            queue_pressure_units,
+            active: true,
+        }
+    }
+
+    pub fn finish(&mut self) {
+        if self.active {
+            if let Ok(mut metrics) = self.metrics.lock() {
+                metrics.end_provider_request(&self.provider_name, self.queue_pressure_units);
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ProviderInFlightGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    Completed,
+    MidStreamFailure,
+    IdleTimeout,
+    Incomplete,
+    Cancelled,
+}
+
+impl StreamOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::MidStreamFailure => "mid_stream_failure",
+            Self::IdleTimeout => "idle_timeout",
+            Self::Incomplete => "incomplete",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct StreamMetricsGuard {
+    metrics: Arc<Mutex<MetricsRegistry>>,
+    started: Instant,
+    active: bool,
+}
+
+impl StreamMetricsGuard {
+    pub fn new(metrics: Arc<Mutex<MetricsRegistry>>) -> Self {
+        Self {
+            metrics,
+            started: Instant::now(),
+            active: true,
+        }
+    }
+
+    pub fn finish(&mut self, outcome: StreamOutcome) {
+        if self.active {
+            let duration_ms = self.started.elapsed().as_millis() as u64;
+            if let Ok(mut metrics) = self.metrics.lock() {
+                metrics.record_stream_outcome(outcome.as_str(), duration_ms);
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for StreamMetricsGuard {
+    fn drop(&mut self) {
+        self.finish(StreamOutcome::Cancelled);
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
@@ -34,10 +153,20 @@ pub struct MetricsSnapshot {
     pub fallback_attempts_by_provider: BTreeMap<String, u64>,
     pub request_errors_by_category: BTreeMap<String, u64>,
     pub provider_errors_by_provider_and_category: BTreeMap<String, BTreeMap<String, u64>>,
+    pub recent_provider_errors_by_provider_and_category: BTreeMap<String, BTreeMap<String, u64>>,
+    pub admission_rejections_by_reason: BTreeMap<String, u64>,
     pub avg_latency_ms_by_provider: BTreeMap<String, f64>,
     pub p95_latency_ms_by_provider: BTreeMap<String, f64>,
+    pub in_flight_requests_by_provider: BTreeMap<String, u64>,
+    pub p50_ttft_ms_by_provider: BTreeMap<String, f64>,
+    pub p95_ttft_ms_by_provider: BTreeMap<String, f64>,
+    pub queue_pressure_by_provider: BTreeMap<String, f64>,
+    pub routing_decisions_by_policy_and_reason: BTreeMap<String, BTreeMap<String, u64>>,
+    pub prefix_fingerprints_by_outcome: BTreeMap<String, u64>,
     pub cache_lookups_by_outcome: BTreeMap<String, u64>,
     pub cache_hit_ratio: f64,
+    pub stream_outcomes_by_outcome: BTreeMap<String, u64>,
+    pub p95_stream_duration_ms: f64,
 }
 
 #[derive(Debug, Default)]
@@ -60,11 +189,20 @@ pub struct MetricsRegistry {
     fallback_attempts_by_provider: BTreeMap<String, u64>,
     request_errors_by_category: BTreeMap<String, u64>,
     provider_errors_by_provider_and_category: BTreeMap<String, BTreeMap<String, u64>>,
+    provider_error_samples: BTreeMap<String, VecDeque<String>>,
+    admission_rejections_by_reason: BTreeMap<String, u64>,
     provider_latency_samples_ms: BTreeMap<String, Vec<u64>>,
+    provider_ttft_samples_ms: BTreeMap<String, Vec<u64>>,
     provider_total_latency_ms: BTreeMap<String, u128>,
+    in_flight_requests_by_provider: BTreeMap<String, u64>,
+    provider_queue_pressure_units: BTreeMap<String, u64>,
+    routing_decisions_by_policy_and_reason: BTreeMap<String, BTreeMap<String, u64>>,
+    prefix_fingerprints_by_outcome: BTreeMap<String, u64>,
     latency_samples_ms: Vec<u64>,
     total_latency_ms: u128,
     cache_lookups_by_outcome: BTreeMap<String, u64>,
+    stream_outcomes_by_outcome: BTreeMap<String, u64>,
+    stream_duration_samples_ms: Vec<u64>,
 }
 
 impl MetricsRegistry {
@@ -74,6 +212,62 @@ impl MetricsRegistry {
 
     pub fn end_request(&mut self) {
         self.in_flight_requests = self.in_flight_requests.saturating_sub(1);
+    }
+
+    pub fn begin_provider_request(&mut self, provider_name: &str, queue_pressure_units: u64) {
+        *self
+            .in_flight_requests_by_provider
+            .entry(provider_name.to_string())
+            .or_default() += 1;
+        *self
+            .provider_queue_pressure_units
+            .entry(provider_name.to_string())
+            .or_default() += queue_pressure_units;
+    }
+
+    pub fn end_provider_request(&mut self, provider_name: &str, queue_pressure_units: u64) {
+        decrement_or_remove(&mut self.in_flight_requests_by_provider, provider_name, 1);
+        decrement_or_remove(
+            &mut self.provider_queue_pressure_units,
+            provider_name,
+            queue_pressure_units,
+        );
+    }
+
+    pub fn record_provider_ttft(&mut self, provider_name: &str, ttft_ms: u64) {
+        let samples = self
+            .provider_ttft_samples_ms
+            .entry(provider_name.to_string())
+            .or_default();
+
+        if samples.len() == MAX_LATENCY_SAMPLES {
+            samples.remove(0);
+        }
+
+        samples.push(ttft_ms);
+    }
+
+    pub fn record_routing_decision(&mut self, policy: &str, reason: &str) {
+        *self
+            .routing_decisions_by_policy_and_reason
+            .entry(policy.to_string())
+            .or_default()
+            .entry(reason.to_string())
+            .or_default() += 1;
+    }
+
+    pub fn record_prefix_fingerprint(&mut self, outcome: &str) {
+        *self
+            .prefix_fingerprints_by_outcome
+            .entry(outcome.to_string())
+            .or_default() += 1;
+    }
+
+    pub fn record_admission_rejection(&mut self, reason: &str) {
+        *self
+            .admission_rejections_by_reason
+            .entry(reason.to_string())
+            .or_default() += 1;
     }
 
     pub fn record_success(
@@ -113,6 +307,18 @@ impl MetricsRegistry {
             .cache_lookups_by_outcome
             .entry(outcome.to_string())
             .or_default() += 1;
+    }
+
+    pub fn record_stream_outcome(&mut self, outcome: &str, duration_ms: u64) {
+        *self
+            .stream_outcomes_by_outcome
+            .entry(outcome.to_string())
+            .or_default() += 1;
+
+        if self.stream_duration_samples_ms.len() == MAX_LATENCY_SAMPLES {
+            self.stream_duration_samples_ms.remove(0);
+        }
+        self.stream_duration_samples_ms.push(duration_ms);
     }
 
     pub fn record_chat_success(
@@ -184,10 +390,23 @@ impl MetricsRegistry {
             provider_errors_by_provider_and_category: self
                 .provider_errors_by_provider_and_category
                 .clone(),
+            recent_provider_errors_by_provider_and_category: self
+                .recent_provider_errors_by_provider_and_category(),
+            admission_rejections_by_reason: self.admission_rejections_by_reason.clone(),
             avg_latency_ms_by_provider: self.avg_latency_ms_by_provider(),
             p95_latency_ms_by_provider: self.p95_latency_ms_by_provider(),
+            in_flight_requests_by_provider: self.in_flight_requests_by_provider.clone(),
+            p50_ttft_ms_by_provider: self.p50_ttft_ms_by_provider(),
+            p95_ttft_ms_by_provider: self.p95_ttft_ms_by_provider(),
+            queue_pressure_by_provider: self.queue_pressure_by_provider(),
+            routing_decisions_by_policy_and_reason: self
+                .routing_decisions_by_policy_and_reason
+                .clone(),
+            prefix_fingerprints_by_outcome: self.prefix_fingerprints_by_outcome.clone(),
             cache_lookups_by_outcome: self.cache_lookups_by_outcome.clone(),
             cache_hit_ratio: self.cache_hit_ratio(),
+            stream_outcomes_by_outcome: self.stream_outcomes_by_outcome.clone(),
+            p95_stream_duration_ms: self.p95_stream_duration_ms(),
         }
     }
 
@@ -215,6 +434,10 @@ impl MetricsRegistry {
                     .entry(attempt.provider_name.clone())
                     .or_default() += 1;
                 if let Some(error_category) = attempt.error_category {
+                    self.record_provider_error_sample(
+                        &attempt.provider_name,
+                        error_category.as_str(),
+                    );
                     *self
                         .provider_errors_by_provider_and_category
                         .entry(attempt.provider_name.clone())
@@ -304,6 +527,61 @@ impl MetricsRegistry {
             .collect()
     }
 
+    fn p95_ttft_ms_by_provider(&self) -> BTreeMap<String, f64> {
+        self.provider_ttft_samples_ms
+            .iter()
+            .map(|(provider_name, samples)| {
+                (provider_name.clone(), percentile_latency(samples, 0.95))
+            })
+            .collect()
+    }
+
+    fn p50_ttft_ms_by_provider(&self) -> BTreeMap<String, f64> {
+        self.provider_ttft_samples_ms
+            .iter()
+            .map(|(provider_name, samples)| {
+                (provider_name.clone(), percentile_latency(samples, 0.50))
+            })
+            .collect()
+    }
+
+    fn p95_stream_duration_ms(&self) -> f64 {
+        percentile_latency(&self.stream_duration_samples_ms, 0.95)
+    }
+
+    fn queue_pressure_by_provider(&self) -> BTreeMap<String, f64> {
+        self.provider_queue_pressure_units
+            .iter()
+            .map(|(provider_name, pressure)| (provider_name.clone(), *pressure as f64))
+            .collect()
+    }
+
+    fn recent_provider_errors_by_provider_and_category(
+        &self,
+    ) -> BTreeMap<String, BTreeMap<String, u64>> {
+        self.provider_error_samples
+            .iter()
+            .map(|(provider_name, samples)| {
+                let mut categories = BTreeMap::new();
+                for category in samples {
+                    *categories.entry(category.clone()).or_default() += 1;
+                }
+                (provider_name.clone(), categories)
+            })
+            .collect()
+    }
+
+    fn record_provider_error_sample(&mut self, provider_name: &str, error_category: &str) {
+        let samples = self
+            .provider_error_samples
+            .entry(provider_name.to_string())
+            .or_default();
+        if samples.len() == MAX_ERROR_SAMPLES {
+            samples.pop_front();
+        }
+        samples.push_back(error_category.to_string());
+    }
+
     fn cache_hit_ratio(&self) -> f64 {
         let hits = self
             .cache_lookups_by_outcome
@@ -324,6 +602,15 @@ impl MetricsRegistry {
     }
 }
 
+fn decrement_or_remove(map: &mut BTreeMap<String, u64>, key: &str, amount: u64) {
+    if let Some(value) = map.get_mut(key) {
+        *value = value.saturating_sub(amount);
+        if *value == 0 {
+            map.remove(key);
+        }
+    }
+}
+
 fn percentile_latency(samples: &[u64], percentile: f64) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -339,7 +626,7 @@ fn percentile_latency(samples: &[u64], percentile: f64) -> f64 {
 mod tests {
     use crate::{models::chat::TokenUsage, providers::provider::CostEstimate};
 
-    use super::{MetricsRegistry, MAX_LATENCY_SAMPLES};
+    use super::{MetricsRegistry, ProviderLoadEstimate, MAX_LATENCY_SAMPLES};
 
     #[test]
     fn snapshot_includes_provider_counts_tokens_and_cost() {
@@ -413,5 +700,75 @@ mod tests {
         metrics.record_failure("mock-fast", 50);
 
         assert_eq!(metrics.snapshot().p95_latency_ms, 50.0);
+    }
+
+    #[test]
+    fn provider_in_flight_and_queue_pressure_release() {
+        let mut metrics = MetricsRegistry::default();
+        let load_estimate = ProviderLoadEstimate {
+            prompt_tokens: 2_100,
+            max_completion_tokens: Some(50),
+        };
+        let pressure_units = load_estimate.queue_pressure_units();
+
+        metrics.begin_provider_request("replica-a", pressure_units);
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(
+            snapshot.in_flight_requests_by_provider.get("replica-a"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot.queue_pressure_by_provider.get("replica-a"),
+            Some(&(pressure_units as f64))
+        );
+
+        metrics.end_provider_request("replica-a", pressure_units);
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(
+            snapshot.in_flight_requests_by_provider.get("replica-a"),
+            None
+        );
+        assert_eq!(snapshot.queue_pressure_by_provider.get("replica-a"), None);
+    }
+
+    #[test]
+    fn ttft_samples_and_routing_decisions_are_snapshotted() {
+        let mut metrics = MetricsRegistry::default();
+
+        metrics.record_provider_ttft("replica-a", 25);
+        metrics.record_provider_ttft("replica-a", 75);
+        metrics.record_routing_decision("latency", "recent_latency_p95");
+        metrics.record_routing_decision("latency", "recent_latency_p95");
+
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(
+            snapshot.p50_ttft_ms_by_provider.get("replica-a"),
+            Some(&25.0)
+        );
+        assert_eq!(
+            snapshot.p95_ttft_ms_by_provider.get("replica-a"),
+            Some(&75.0)
+        );
+        assert_eq!(
+            snapshot.routing_decisions_by_policy_and_reason["latency"]["recent_latency_p95"],
+            2
+        );
+    }
+
+    #[test]
+    fn stream_outcomes_and_duration_are_snapshotted() {
+        let mut metrics = MetricsRegistry::default();
+
+        metrics.record_stream_outcome("completed", 100);
+        metrics.record_stream_outcome("idle_timeout", 250);
+
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.stream_outcomes_by_outcome["completed"], 1);
+        assert_eq!(snapshot.stream_outcomes_by_outcome["idle_timeout"], 1);
+        assert_eq!(snapshot.p95_stream_duration_ms, 250.0);
     }
 }

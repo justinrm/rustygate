@@ -1,4 +1,10 @@
+pub mod admission;
 pub mod fallback;
 pub mod health;
+pub mod model_pools;
+pub mod prefix_affinity;
+pub mod prefix_fingerprint;
 pub mod resilience;
+#[cfg(feature = "runtime-cache-signals")]
+pub mod runtime_signals;
 pub mod strategy;

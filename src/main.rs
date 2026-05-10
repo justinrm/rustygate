@@ -17,7 +17,8 @@ async fn main() -> anyhow::Result<()> {
     let storage_enabled = config.storage.enabled;
     let state = app::AppState::from_config(&config).await?;
     rustygate::routing::health::spawn_provider_health_probes(
-        state.clone(),
+        state.providers.clone(),
+        state.provider_health.clone(),
         Duration::from_millis(config.gateway.health_check_interval_ms),
     );
     if let Some(store) = state.request_log_store.clone() {

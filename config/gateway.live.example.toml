@@ -5,12 +5,23 @@ shutdown_grace_period_ms = 10000
 
 [gateway]
 default_timeout_ms = 30000
+stream_idle_timeout_ms = 30000
 max_retries = 1
 enable_request_logging = true
 log_prompt_content = false
 api_key_env = "RUSTYGATE_GATEWAY_API_KEY"
-routing_policy = "priority"
-model_aliases = { "gpt-4o" = "gpt-4o-mini", "claude-sonnet" = "claude-3-5-sonnet-latest" }
+routing_policy = "prefix_affinity"
+model_aliases = { "gpt-4o" = "gpt4o-selfhosted-pool", "claude-sonnet" = "claude-3-5-sonnet-latest" }
+
+[gateway.route_exposure]
+# Live provider examples default to the real provider-backed route surface.
+placeholder_compat_routes = false
+
+[gateway.prefix_affinity]
+ttl_seconds = 300
+max_entries = 10000
+load_imbalance_threshold = 2
+fallback_policy = "latency"
 
 [gateway.retry]
 initial_backoff_ms = 100
@@ -33,6 +44,12 @@ max_chat_body_bytes = 65536
 max_messages_per_request = 64
 max_message_content_chars = 8000
 
+[gateway.admission]
+max_global_in_flight = 64
+max_estimated_prompt_tokens = 16384
+max_estimated_total_tokens = 24576
+retry_after_seconds = 1
+
 [storage]
 enabled = false
 database_url = "sqlite://rustygate.db"
@@ -40,9 +57,9 @@ database_url = "sqlite://rustygate.db"
 [[providers]]
 name = "openai-primary"
 kind = "openai_compatible"
-model = "gpt-4o-mini"
+model = "selfhosted-gpt4o-replica-a"
 priority = 1
-base_url = "https://api.openai.com/v1"
+base_url = "http://127.0.0.1:8001/v1"
 api_key_env = "OPENAI_API_KEY"
 timeout_ms = 15000
 max_retries = 2
@@ -52,16 +69,26 @@ retry_jitter_ms = 50
 circuit_breaker_failure_threshold = 2
 circuit_breaker_open_duration_ms = 3000
 circuit_breaker_half_open_max_probes = 1
+max_in_flight = 16
 cost_per_1k_input_tokens = 0.00015
 cost_per_1k_output_tokens = 0.0006
 
 [[providers]]
-name = "mock-openai-backup"
-kind = "mock"
-model = "gpt-4o-mini"
+name = "openai-replica-b"
+kind = "openai_compatible"
+model = "selfhosted-gpt4o-replica-b"
 priority = 2
-failure_rate = 0.0
-base_latency_ms = 0
+base_url = "http://127.0.0.1:8002/v1"
+api_key_env = "OPENAI_API_KEY"
+timeout_ms = 15000
+max_retries = 2
+retry_initial_backoff_ms = 100
+retry_max_backoff_ms = 1000
+retry_jitter_ms = 50
+circuit_breaker_failure_threshold = 2
+circuit_breaker_open_duration_ms = 3000
+circuit_breaker_half_open_max_probes = 1
+max_in_flight = 16
 cost_per_1k_input_tokens = 0.0
 cost_per_1k_output_tokens = 0.0
 
@@ -72,5 +99,13 @@ model = "claude-3-5-sonnet-latest"
 priority = 1
 base_url = "https://api.anthropic.com"
 api_key_env = "ANTHROPIC_API_KEY"
+max_in_flight = 32
 cost_per_1k_input_tokens = 0.00015
 cost_per_1k_output_tokens = 0.00075
+
+[[model_pools]]
+name = "gpt4o-selfhosted-pool"
+aliases = ["gpt4o-selfhosted"]
+routing_policy = "prefix_affinity"
+members = ["openai-primary", "openai-replica-b"]
+max_in_flight = 24

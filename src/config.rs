@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub model_pools: Vec<ModelPoolConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,11 +35,17 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
     pub default_timeout_ms: u64,
+    #[serde(default = "default_stream_idle_timeout_ms")]
+    pub stream_idle_timeout_ms: u64,
     pub max_retries: u32,
     #[serde(default = "default_health_check_interval_ms")]
     pub health_check_interval_ms: u64,
     #[serde(default)]
     pub routing_policy: RoutingPolicy,
+    #[serde(default)]
+    pub prefix_affinity: PrefixAffinityConfig,
+    #[serde(default)]
+    pub route_exposure: RouteExposureConfig,
     #[serde(default)]
     pub model_aliases: BTreeMap<String, String>,
     #[serde(default)]
@@ -51,6 +59,8 @@ pub struct GatewayConfig {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub request_limits: RequestLimitsConfig,
+    #[serde(default)]
+    pub admission: AdmissionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,6 +147,68 @@ pub enum RoutingPolicy {
     Priority,
     Cost,
     Latency,
+    PrefixAffinity,
+}
+
+impl RoutingPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::Cost => "cost",
+            Self::Latency => "latency",
+            Self::PrefixAffinity => "prefix_affinity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct RouteExposureConfig {
+    #[serde(default = "default_placeholder_compat_routes")]
+    pub placeholder_compat_routes: bool,
+}
+
+impl Default for RouteExposureConfig {
+    fn default() -> Self {
+        Self {
+            placeholder_compat_routes: default_placeholder_compat_routes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrefixAffinityConfig {
+    #[serde(default = "default_prefix_affinity_ttl_seconds")]
+    pub ttl_seconds: u64,
+    #[serde(default = "default_prefix_affinity_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_prefix_affinity_load_imbalance_threshold")]
+    pub load_imbalance_threshold: u64,
+    #[serde(default = "default_prefix_affinity_fallback_policy")]
+    pub fallback_policy: RoutingPolicy,
+}
+
+impl Default for PrefixAffinityConfig {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: default_prefix_affinity_ttl_seconds(),
+            max_entries: default_prefix_affinity_max_entries(),
+            load_imbalance_threshold: default_prefix_affinity_load_imbalance_threshold(),
+            fallback_policy: default_prefix_affinity_fallback_policy(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelPoolConfig {
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub routing_policy: Option<RoutingPolicy>,
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub max_in_flight: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -243,6 +315,29 @@ impl Default for RequestLimitsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct AdmissionConfig {
+    #[serde(default)]
+    pub max_global_in_flight: Option<u64>,
+    #[serde(default)]
+    pub max_estimated_prompt_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_estimated_total_tokens: Option<u32>,
+    #[serde(default = "default_admission_retry_after_seconds")]
+    pub retry_after_seconds: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            max_global_in_flight: None,
+            max_estimated_prompt_tokens: None,
+            max_estimated_total_tokens: None,
+            retry_after_seconds: default_admission_retry_after_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -292,6 +387,8 @@ pub struct ProviderConfig {
     pub circuit_breaker_open_duration_ms: Option<u64>,
     #[serde(default)]
     pub circuit_breaker_half_open_max_probes: Option<u32>,
+    #[serde(default)]
+    pub max_in_flight: Option<u64>,
     pub cost_per_1k_input_tokens: f64,
     pub cost_per_1k_output_tokens: f64,
 }
@@ -344,11 +441,35 @@ fn default_semantic_index_capacity() -> usize {
     10_000
 }
 
+fn default_prefix_affinity_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_placeholder_compat_routes() -> bool {
+    true
+}
+
+fn default_prefix_affinity_max_entries() -> usize {
+    10_000
+}
+
+fn default_prefix_affinity_load_imbalance_threshold() -> u64 {
+    2
+}
+
+fn default_prefix_affinity_fallback_policy() -> RoutingPolicy {
+    RoutingPolicy::Latency
+}
+
 fn default_retry_initial_backoff_ms() -> u64 {
     100
 }
 
 fn default_health_check_interval_ms() -> u64 {
+    30_000
+}
+
+fn default_stream_idle_timeout_ms() -> u64 {
     30_000
 }
 
@@ -408,6 +529,10 @@ fn default_max_message_content_chars() -> usize {
     8_000
 }
 
+fn default_admission_retry_after_seconds() -> u64 {
+    1
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
@@ -446,7 +571,12 @@ impl AppConfig {
         validate_telemetry_config(&self.telemetry, &mut errors);
         validate_cache_config(&self.cache, &mut errors);
         validate_storage_config(&self.storage, &mut errors);
-        validate_providers(&self.providers, &self.gateway, &mut errors);
+        validate_providers(
+            &self.providers,
+            &self.gateway,
+            &self.model_pools,
+            &mut errors,
+        );
 
         if errors.is_empty() {
             Ok(())
@@ -499,6 +629,9 @@ fn validate_telemetry_config(telemetry: &TelemetryConfig, errors: &mut Vec<Strin
 fn validate_gateway_config(gateway: &GatewayConfig, errors: &mut Vec<String>) {
     if gateway.default_timeout_ms == 0 {
         errors.push("gateway.default_timeout_ms must be greater than 0".to_string());
+    }
+    if gateway.stream_idle_timeout_ms == 0 {
+        errors.push("gateway.stream_idle_timeout_ms must be greater than 0".to_string());
     }
     if gateway.health_check_interval_ms == 0 {
         errors.push("gateway.health_check_interval_ms must be greater than 0".to_string());
@@ -568,6 +701,32 @@ fn validate_gateway_config(gateway: &GatewayConfig, errors: &mut Vec<String>) {
         errors
             .push("gateway.request_limits.max_message_content_chars must be greater than 0".into());
     }
+    if gateway.prefix_affinity.ttl_seconds == 0 {
+        errors.push("gateway.prefix_affinity.ttl_seconds must be greater than 0".into());
+    }
+    if gateway.prefix_affinity.max_entries == 0 {
+        errors.push("gateway.prefix_affinity.max_entries must be greater than 0".into());
+    }
+    if matches!(
+        gateway.prefix_affinity.fallback_policy,
+        RoutingPolicy::Cost | RoutingPolicy::PrefixAffinity
+    ) {
+        errors.push(
+            "gateway.prefix_affinity.fallback_policy must be either priority or latency".into(),
+        );
+    }
+    if gateway.admission.max_global_in_flight == Some(0) {
+        errors.push("gateway.admission.max_global_in_flight must be greater than 0".into());
+    }
+    if gateway.admission.max_estimated_prompt_tokens == Some(0) {
+        errors.push("gateway.admission.max_estimated_prompt_tokens must be greater than 0".into());
+    }
+    if gateway.admission.max_estimated_total_tokens == Some(0) {
+        errors.push("gateway.admission.max_estimated_total_tokens must be greater than 0".into());
+    }
+    if gateway.admission.retry_after_seconds == 0 {
+        errors.push("gateway.admission.retry_after_seconds must be greater than 0".into());
+    }
 
     for (alias, target) in &gateway.model_aliases {
         if alias.trim().is_empty() {
@@ -593,6 +752,7 @@ fn validate_storage_config(storage: &StorageConfig, errors: &mut Vec<String>) {
 fn validate_providers(
     providers: &[ProviderConfig],
     gateway: &GatewayConfig,
+    model_pools: &[ModelPoolConfig],
     errors: &mut Vec<String>,
 ) {
     if providers.is_empty() {
@@ -600,15 +760,31 @@ fn validate_providers(
     }
 
     let mut names = HashSet::new();
-    let models: HashSet<&str> = providers
+    let provider_models: HashSet<&str> = providers
         .iter()
         .map(|provider| provider.model.as_str())
         .collect();
+    let provider_names: HashSet<&str> = providers
+        .iter()
+        .map(|provider| provider.name.as_str())
+        .collect();
+    let pool_public_models = validate_model_pools(
+        model_pools,
+        &provider_names,
+        &provider_models,
+        &gateway.model_aliases,
+        errors,
+    );
+    let valid_alias_targets = provider_models
+        .iter()
+        .copied()
+        .chain(pool_public_models.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
 
     for target in gateway.model_aliases.values() {
-        if !target.trim().is_empty() && !models.contains(target.as_str()) {
+        if !target.trim().is_empty() && !valid_alias_targets.contains(target.as_str()) {
             errors.push(format!(
-                "gateway.model_aliases target `{target}` must match a configured provider model"
+                "gateway.model_aliases target `{target}` must match a configured provider model or model pool"
             ));
         }
     }
@@ -667,11 +843,110 @@ fn validate_providers(
                 provider.name
             ));
         }
+        if provider.max_in_flight == Some(0) {
+            errors.push(format!(
+                "provider `{}` max_in_flight must be greater than 0",
+                provider.name
+            ));
+        }
 
         validate_provider_auth(provider, errors);
         validate_provider_retry(provider, gateway, errors);
         validate_provider_breaker(provider, gateway, errors);
     }
+}
+
+fn validate_model_pools(
+    model_pools: &[ModelPoolConfig],
+    provider_names: &HashSet<&str>,
+    provider_models: &HashSet<&str>,
+    model_aliases: &BTreeMap<String, String>,
+    errors: &mut Vec<String>,
+) -> HashSet<String> {
+    let mut seen_pool_names = HashSet::new();
+    let mut seen_public_models = HashSet::new();
+    let mut public_models = HashSet::new();
+
+    for pool in model_pools {
+        let pool_name = pool.name.trim();
+        if pool_name.is_empty() {
+            errors.push("model_pools entries must have a non-empty name".to_string());
+            continue;
+        }
+        if !seen_pool_names.insert(pool_name.to_string()) {
+            errors.push(format!("duplicate model pool name `{pool_name}`"));
+            continue;
+        }
+        if provider_models.contains(pool_name) {
+            errors.push(format!(
+                "model pool `{pool_name}` conflicts with configured provider model `{pool_name}`"
+            ));
+        }
+        if model_aliases.contains_key(pool_name) {
+            errors.push(format!(
+                "model pool `{pool_name}` conflicts with gateway.model_aliases key `{pool_name}`"
+            ));
+        }
+        if !seen_public_models.insert(pool_name.to_string()) {
+            errors.push(format!(
+                "model pool public model ID `{pool_name}` is defined more than once"
+            ));
+        }
+        public_models.insert(pool_name.to_string());
+
+        if pool.members.is_empty() {
+            errors.push(format!(
+                "model pool `{pool_name}` must include at least one member provider"
+            ));
+        }
+        if pool.max_in_flight == Some(0) {
+            errors.push(format!(
+                "model pool `{pool_name}` max_in_flight must be greater than 0"
+            ));
+        }
+        for member in &pool.members {
+            let member_name = member.trim();
+            if member_name.is_empty() {
+                errors.push(format!(
+                    "model pool `{pool_name}` must not contain empty member names"
+                ));
+                continue;
+            }
+            if !provider_names.contains(member_name) {
+                errors.push(format!(
+                    "model pool `{pool_name}` member `{member_name}` must reference a configured provider"
+                ));
+            }
+        }
+
+        for alias in &pool.aliases {
+            let alias_name = alias.trim();
+            if alias_name.is_empty() {
+                errors.push(format!(
+                    "model pool `{pool_name}` must not contain empty aliases"
+                ));
+                continue;
+            }
+            if provider_models.contains(alias_name) {
+                errors.push(format!(
+                    "model pool `{pool_name}` alias `{alias_name}` conflicts with configured provider model `{alias_name}`"
+                ));
+            }
+            if model_aliases.contains_key(alias_name) {
+                errors.push(format!(
+                    "model pool `{pool_name}` alias `{alias_name}` conflicts with gateway.model_aliases key `{alias_name}`"
+                ));
+            }
+            if !seen_public_models.insert(alias_name.to_string()) {
+                errors.push(format!(
+                    "model pool public model ID `{alias_name}` is defined more than once"
+                ));
+            }
+            public_models.insert(alias_name.to_string());
+        }
+    }
+
+    public_models
 }
 
 fn validate_provider_auth(provider: &ProviderConfig, errors: &mut Vec<String>) {

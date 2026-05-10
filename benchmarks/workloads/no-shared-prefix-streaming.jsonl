@@ -1,0 +1,4 @@
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Stream a short benchmark response about a billing export."}],"temperature":0,"max_tokens":64,"stream":true}
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Stream a short benchmark response about a queue drain."}],"temperature":0,"max_tokens":64,"stream":true}
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Stream a short benchmark response about a schema migration."}],"temperature":0,"max_tokens":64,"stream":true}
+{"model":"benchmark-mock","messages":[{"role":"user","content":"Stream a short benchmark response about a retry budget."}],"temperature":0,"max_tokens":64,"stream":true}

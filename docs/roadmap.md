@@ -4,9 +4,9 @@ RustyGate should grow in small, reviewable steps.
 
 ## Current Status
 
-RustyGate is past the original MVP and now sits at a lightweight internal/demo gateway baseline. The current feature set includes mock and real providers, non-streaming and SSE streaming chat completions, gateway bearer auth, in-memory rate limiting, retries, fallback, circuit breakers, Prometheus-compatible metrics, model discovery, optional SQLite persistence, Docker, CI, deployment profiles, and an operations runbook.
+RustyGate is past the original MVP and now sits at a lightweight internal/demo gateway baseline. The current feature set includes mock and real providers, non-streaming and SSE streaming chat completions, gateway bearer auth, in-memory rate limiting, retries, fallback, circuit breakers, admission control, Prometheus-compatible metrics, OpenTelemetry trace export, model discovery, optional SQLite persistence, Docker, CI, deployment profiles, and an operations runbook.
 
-The project is now entering a focused `v0.3` portfolio-hardening scope. The goal is to strengthen the gateway with production-shaped capabilities that read well in review while preserving the small, testable gateway shape.
+`v0.3` portfolio hardening is complete. `v0.4` adds model pools, load-aware state, admission control, prefix fingerprinting, heuristic prefix-affinity routing, streaming hardening, and shared-prefix benchmarks without turning RustyGate into a model runtime.
 
 ## MVP
 
@@ -42,12 +42,10 @@ The project is now entering a focused `v0.3` portfolio-hardening scope. The goal
 
 ## Remaining Lightweight Gaps
 
-- Provider health checks
-- Multi-key auth management and key rotation workflow
-- Distributed/shared rate limiting beyond a single process
 - SQLite retention and cleanup controls
-- OpenTelemetry traces
 - Optional default model configuration
+- Shared admission, circuit-breaker, and prefix-affinity state across multiple RustyGate processes
+- Runtime-specific cache/load adapters if future benchmarks justify them
 
 ## v0.2 Responses-First OpenAI Compatibility
 
@@ -74,6 +72,19 @@ The `v0.3` track is explicitly approved to add the following production-shaped f
 - Opt-in exact-match response caching with hit-rate metrics.
 - Optional semantic caching behind a Cargo feature after exact-match caching lands.
 - A reproducible benchmark page comparing RustyGate with a Python gateway baseline.
+
+## v0.4 Inference-Aware Routing And Admission
+
+`v0.4` targets a practical bottleneck for self-hosted replicas: wasteful prefill and poor cache locality when many requests share long prompt prefixes. The goal is to improve request placement and overload handling while keeping RustyGate a small gateway edge.
+
+RustyGate should stay a gateway boundary, not an inference runtime:
+
+- Gateway can influence: routing decisions, admission and queueing policy, retries and fallback behavior, and observability around these decisions.
+- Gateway cannot influence without runtime integration: actual KV allocation and eviction, runtime batching internals, GPU scheduling, and prefill/decode execution itself.
+
+Initial `v0.4` slices should remain heuristic and testable, then optionally evolve toward precise runtime-aware behavior only when stable runtime signals are available.
+
+The precise KV-cache awareness spike is a no-go for a real adapter in `v0.4`: `runtime-cache-signals` remains an experimental, mock-backed feature, with rationale in `docs/inference-aware-routing.md`.
 
 ## Do Not Build Yet
 

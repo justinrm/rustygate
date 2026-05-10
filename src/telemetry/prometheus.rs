@@ -87,6 +87,13 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
         "gauge",
         snapshot.cache_hit_ratio,
     );
+    write_metric(
+        &mut output,
+        "rustygate_stream_duration_ms_p95",
+        "P95 completed or terminated stream duration in milliseconds.",
+        "gauge",
+        snapshot.p95_stream_duration_ms,
+    );
 
     write_labeled_header(
         &mut output,
@@ -105,6 +112,21 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
 
     write_labeled_header(
         &mut output,
+        "rustygate_stream_outcomes_total",
+        "Streaming requests by terminal outcome.",
+        "counter",
+    );
+    for (outcome, count) in &snapshot.stream_outcomes_by_outcome {
+        write_labeled_metric(
+            &mut output,
+            "rustygate_stream_outcomes_total",
+            &[("outcome", outcome)],
+            *count as f64,
+        );
+    }
+
+    write_labeled_header(
+        &mut output,
         "rustygate_request_errors_total",
         "Chat request errors by category.",
         "counter",
@@ -114,6 +136,21 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
             &mut output,
             "rustygate_request_errors_total",
             &[("category", category)],
+            *count as f64,
+        );
+    }
+
+    write_labeled_header(
+        &mut output,
+        "rustygate_admission_rejections_total",
+        "Admission-control rejections by reason.",
+        "counter",
+    );
+    for (reason, count) in &snapshot.admission_rejections_by_reason {
+        write_labeled_metric(
+            &mut output,
+            "rustygate_admission_rejections_total",
+            &[("reason", reason)],
             *count as f64,
         );
     }
@@ -192,6 +229,98 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
             "rustygate_provider_latency_ms_p95",
             &[("provider", provider)],
             *latency_ms,
+        );
+    }
+
+    write_labeled_header(
+        &mut output,
+        "rustygate_provider_in_flight_requests",
+        "Current in-flight provider attempts by provider.",
+        "gauge",
+    );
+    for (provider, count) in &snapshot.in_flight_requests_by_provider {
+        write_labeled_metric(
+            &mut output,
+            "rustygate_provider_in_flight_requests",
+            &[("provider", provider)],
+            *count as f64,
+        );
+    }
+
+    write_labeled_header(
+        &mut output,
+        "rustygate_provider_ttft_ms_p50",
+        "P50 provider time to first token for streaming attempts in milliseconds.",
+        "gauge",
+    );
+    for (provider, ttft_ms) in &snapshot.p50_ttft_ms_by_provider {
+        write_labeled_metric(
+            &mut output,
+            "rustygate_provider_ttft_ms_p50",
+            &[("provider", provider)],
+            *ttft_ms,
+        );
+    }
+
+    write_labeled_header(
+        &mut output,
+        "rustygate_provider_ttft_ms_p95",
+        "P95 provider time to first token for streaming attempts in milliseconds.",
+        "gauge",
+    );
+    for (provider, ttft_ms) in &snapshot.p95_ttft_ms_by_provider {
+        write_labeled_metric(
+            &mut output,
+            "rustygate_provider_ttft_ms_p95",
+            &[("provider", provider)],
+            *ttft_ms,
+        );
+    }
+
+    write_labeled_header(
+        &mut output,
+        "rustygate_provider_queue_pressure",
+        "Approximate provider queue pressure based on active requests and estimated tokens.",
+        "gauge",
+    );
+    for (provider, pressure) in &snapshot.queue_pressure_by_provider {
+        write_labeled_metric(
+            &mut output,
+            "rustygate_provider_queue_pressure",
+            &[("provider", provider)],
+            *pressure,
+        );
+    }
+
+    write_labeled_header(
+        &mut output,
+        "rustygate_routing_decisions_total",
+        "Routing decisions by policy and reason.",
+        "counter",
+    );
+    for (policy, reasons) in &snapshot.routing_decisions_by_policy_and_reason {
+        for (reason, count) in reasons {
+            write_labeled_metric(
+                &mut output,
+                "rustygate_routing_decisions_total",
+                &[("policy", policy), ("reason", reason)],
+                *count as f64,
+            );
+        }
+    }
+
+    write_labeled_header(
+        &mut output,
+        "rustygate_prefix_fingerprints_total",
+        "Prefix fingerprint decisions by aggregate outcome.",
+        "counter",
+    );
+    for (outcome, count) in &snapshot.prefix_fingerprints_by_outcome {
+        write_labeled_metric(
+            &mut output,
+            "rustygate_prefix_fingerprints_total",
+            &[("outcome", outcome)],
+            *count as f64,
         );
     }
 

@@ -3,8 +3,10 @@ services:
     build:
       context: ..
     environment:
-      RUSTYGATE_CONFIG: examples/mock-config.toml
+      RUSTYGATE_CONFIG: ${RUSTYGATE_BENCHMARK_CONFIG:-/app/benchmarks/configs/mock-prefix-affinity.toml}
       RUSTYGATE_GATEWAY_API_KEY: benchmark-key
+    volumes:
+      - ./configs:/app/benchmarks/configs:ro
     ports:
       - "8080:8080"
 

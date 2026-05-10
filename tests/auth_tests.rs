@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     http::{header, Request, StatusCode},
 };
 use rustygate::{
@@ -39,6 +39,7 @@ async fn valid_sqlite_key_passes_and_role_mismatch_is_forbidden() {
             Request::builder()
                 .uri("/stats")
                 .method("GET")
+                .header("x-request-id", Uuid::nil().to_string())
                 .header(
                     header::AUTHORIZATION,
                     format!("Bearer {}", generated.raw_key),
@@ -49,6 +50,52 @@ async fn valid_sqlite_key_passes_and_role_mismatch_is_forbidden() {
         .await
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(forbidden.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["request_id"], Uuid::nil().to_string());
+}
+
+#[tokio::test]
+async fn incoming_request_id_is_used_for_auth_errors() {
+    let app = app::router_with_state(app_state());
+
+    let missing_id = Uuid::new_v4();
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/chat/completions")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("x-request-id", missing_id.to_string())
+                .body(Body::from(chat_payload().to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["request_id"], missing_id.to_string());
+
+    let invalid_id = Uuid::new_v4();
+    let invalid = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/chat/completions")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header(header::AUTHORIZATION, "Bearer wrong-key")
+                .header("x-request-id", invalid_id.to_string())
+                .body(Body::from(chat_payload().to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(invalid.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["request_id"], invalid_id.to_string());
 }
 
 #[tokio::test]
@@ -99,10 +146,17 @@ async fn daily_token_quota_rejects_after_usage_is_recorded() {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
     let second = router
-        .oneshot(chat_request(&generated.raw_key, chat_payload()))
+        .oneshot(chat_request_with_request_id(
+            &generated.raw_key,
+            chat_payload(),
+            Uuid::nil(),
+        ))
         .await
         .unwrap();
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["request_id"], Uuid::nil().to_string());
 }
 
 #[test]
@@ -133,6 +187,17 @@ fn chat_request(api_key: &str, payload: Value) -> Request<Body> {
         .method("POST")
         .header("content-type", "application/json")
         .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
+        .body(Body::from(payload.to_string()))
+        .unwrap()
+}
+
+fn chat_request_with_request_id(api_key: &str, payload: Value, request_id: Uuid) -> Request<Body> {
+    Request::builder()
+        .uri("/v1/chat/completions")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
+        .header("x-request-id", request_id.to_string())
         .body(Body::from(payload.to_string()))
         .unwrap()
 }

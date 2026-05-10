@@ -30,13 +30,22 @@ Implemented now:
 - Provider health probes feeding `/ready?detail=true`
 - SQLite-backed multi-key auth with hashed keys, roles, quotas, and `rustygate_admin`
 - Bounded local rate-limit state plus optional Redis-backed rate limiting behind `redis-backend`
+- Admission control for global, model-pool, provider, and estimated-token request budgets
 - OpenAI-compatible tool/function calling for mock, OpenAI-compatible, and Anthropic paths
 - Opt-in exact-match response caching with cache hit/miss metrics
 - Experimental semantic cache primitives behind `semantic-cache`
 - Reproducible benchmark harness under `benchmarks/`
 - Config loading from TOML (`RUSTYGATE_CONFIG` override supported)
 
-Release notes: `docs/releases/v0.2.0.md`
+Current `v0.4` release focus:
+
+- `v0.4` model pools, admission control, prefix fingerprinting, and prefix-affinity routing are documented in `docs/roadmap.md` and `docs/inference-aware-routing.md`.
+- The current runtime behavior includes model pools, load-aware signals, admission control, provider routing/fallback, optional response caching, and existing observability signals.
+- Precise runtime KV-cache awareness remains a feature-gated mock spike under `runtime-cache-signals`; no real runtime adapter ships in `v0.4`.
+
+See [Roadmap](docs/roadmap.md) and [Inference-Aware Routing](docs/inference-aware-routing.md) for scope and terminology.
+
+Release notes: `docs/releases/v0.4.0.md` and `docs/releases/v0.2.0.md`
 
 Operations runbook: `docs/operations.md`
 
@@ -50,7 +59,14 @@ No Kubernetes manifests, multi-user billing, web dashboard, or production policy
 
 - Circuit breaker failure tracking is consecutive-failure based and in-memory only.
 - The semantic cache is experimental and should be enabled only for demos or controlled tests.
-- Benchmarks use mock upstream behavior and measure gateway overhead, not real LLM latency.
+- Runtime cache signals are experimental and mock-backed; RustyGate does not scrape vLLM KV events or runtime metrics yet.
+- Exact-match response caching is not runtime KV-cache reuse; it returns identical deterministic responses before provider execution.
+- Admission control uses local in-process counters and heuristic token estimates; it does not observe GPU memory, runtime queues, or true KV-cache residency.
+- Benchmarks use mock upstream behavior and measure gateway overhead, not true model-runtime latency or GPU execution improvements.
+
+## Not Competing With General Gateways
+
+RustyGate intentionally stays small, documented, and testable for learning and portfolio review. It does not aim to become a full multi-tenant inference platform with policy engines, dashboards, billing systems, or cluster-level orchestration.
 
 ## Quickstart
 
@@ -276,7 +292,7 @@ curl -H "authorization: Bearer ${RUSTYGATE_GATEWAY_API_KEY}" http://127.0.0.1:80
 curl -H "authorization: Bearer ${RUSTYGATE_GATEWAY_API_KEY}" http://127.0.0.1:8080/metrics
 ```
 
-`/stats` reports request totals, success/failure counts, in-flight requests, categorized request errors, latency average and p95, prompt/completion token totals, and input/output estimated cost totals. `/stats/providers` reports provider attempt counts, success counts, error counts, provider error categories, fallback attempt counts, and provider latency average and p95. `/metrics` exposes the same operational signals in Prometheus text format. Stats do not include prompt text or secrets.
+`/stats` reports request totals, success/failure counts, in-flight requests, categorized request errors, admission rejections, latency average and p95, prompt/completion token totals, routing-decision counters, prefix-fingerprint outcomes, stream outcomes, and input/output estimated cost totals. `/stats/providers` reports provider attempt counts, success counts, error counts, provider error categories, fallback attempt counts, provider latency average and p95, in-flight load, queue pressure, TTFT, and circuit state. `/metrics` exposes the same operational signals in Prometheus text format. Stats do not include prompt text or secrets.
 
 Model discovery:
 
@@ -303,8 +319,13 @@ Deployment profiles:
 - `gateway.api_key_env` points to the env var that contains the required gateway bearer token for protected routes.
 - `gateway.rate_limit` controls in-memory token-bucket limits for global traffic and per-key traffic.
 - `gateway.request_limits` controls max chat payload size, max message count, and max message content length.
-- `gateway.model_aliases` maps public model IDs to provider-specific configured model IDs.
-- `gateway.routing_policy` can be `priority`, `cost`, or `latency`; default configs use `priority`.
+- `gateway.model_aliases` maps public model IDs to provider-specific configured model IDs or model-pool public IDs.
+- `gateway.routing_policy` can be `priority`, `cost`, `latency`, or `prefix_affinity`; pool-specific `model_pools[].routing_policy` can override it.
+- `[[model_pools]]` groups provider replicas under one public model surface with optional aliases, routing policy, and `max_in_flight` cap.
+- `gateway.admission.*` controls immediate overload rejection for global in-flight, model-pool in-flight, provider in-flight, and estimated-token budgets.
+- `gateway.prefix_affinity.*` controls the bounded process-local affinity index used only when `prefix_affinity` routing is enabled.
+- `gateway.stream_idle_timeout_ms` bounds the idle gap between streamed provider chunks after an SSE stream starts.
+- `gateway.route_exposure.placeholder_compat_routes` can disable placeholder OpenAI-shaped resource routes in staging or production-style profiles.
 - `[storage]` controls optional SQLite request-log persistence. It is disabled by default; when enabled, request logs and provider attempts are persisted and stats are read from SQLite.
 - `gateway.default_timeout_ms` applies to outbound HTTP calls for real providers, and provider `timeout_ms` can override it.
 - `gateway.max_retries` plus `gateway.retry.*` control same-provider retries with backoff and jitter; provider-level retry fields can override defaults.

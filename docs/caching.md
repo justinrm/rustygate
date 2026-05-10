@@ -2,6 +2,8 @@
 
 RustyGate supports opt-in exact-match response caching for non-streaming, deterministic requests.
 
+For `v0.4` terminology boundaries and the experimental `runtime-cache-signals` spike, see `docs/inference-aware-routing.md`. Response caching and runtime KV-cache behavior are not the same mechanism.
+
 ## Exact-Match Cache
 
 Enable it in TOML:
@@ -40,3 +42,5 @@ index_capacity = 10000
 ```
 
 It stays disabled by default because semantic caching has privacy, cost, and correctness tradeoffs: prompts must be embedded, similarity thresholds need tuning, and approximate hits can return stale or semantically adjacent answers.
+
+Semantic cache behavior should not be described as prefix-affinity routing or KV-cache-aware routing. Those are separate routing concerns.

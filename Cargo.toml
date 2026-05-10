@@ -1,6 +1,6 @@
 [package]
 name = "rustygate"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "A lightweight Rust LLM inference gateway portfolio project."
@@ -49,3 +49,4 @@ wiremock = "0.6"
 [features]
 redis-backend = ["dep:redis"]
 semantic-cache = ["dep:hnsw_rs"]
+runtime-cache-signals = []

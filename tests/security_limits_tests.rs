@@ -20,6 +20,8 @@ use tower::ServiceExt;
 
 const TEST_GATEWAY_KEY: &str = "test-gateway-key";
 
+mod common;
+
 #[tokio::test]
 async fn protected_endpoints_reject_missing_or_invalid_bearer_token() {
     let state = AppState::from_providers(vec![ProviderEntry {
@@ -335,30 +337,13 @@ fn chat_request(body: Value) -> Request<Body> {
 }
 
 fn chat_request_with_token(body: Value, token: &str) -> Request<Body> {
-    Request::builder()
-        .uri("/v1/chat/completions")
-        .method("POST")
-        .header("content-type", "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::from(body.to_string()))
-        .unwrap()
+    common::chat_request_with_token(body, token)
 }
 
 fn chat_request_without_auth(body: Value) -> Request<Body> {
-    Request::builder()
-        .uri("/v1/chat/completions")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
+    common::json_post_without_auth("/v1/chat/completions", body)
 }
 
 fn responses_request(body: Value) -> Request<Body> {
-    Request::builder()
-        .uri("/v1/responses")
-        .method("POST")
-        .header("content-type", "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_GATEWAY_KEY}"))
-        .body(Body::from(body.to_string()))
-        .unwrap()
+    common::responses_request(body)
 }

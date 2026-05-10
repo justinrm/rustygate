@@ -33,6 +33,12 @@ pub enum AppError {
         request_id: Option<Uuid>,
         retry_after_seconds: u64,
     },
+    #[error("request rejected by admission control: {message}")]
+    AdmissionRejected {
+        message: String,
+        request_id: Option<Uuid>,
+        retry_after_seconds: u64,
+    },
     #[error("no provider available")]
     NoProviderAvailable { request_id: Option<Uuid> },
     #[error("provider rate limited the request")]
@@ -64,6 +70,7 @@ impl AppError {
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::GatewayRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::AdmissionRejected { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::NoProviderAvailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::ProviderRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::ProviderTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
@@ -78,6 +85,7 @@ impl AppError {
             Self::Unauthorized { .. } => "unauthorized",
             Self::Forbidden { .. } => "forbidden",
             Self::GatewayRateLimited { .. } => "gateway_rate_limited",
+            Self::AdmissionRejected { .. } => "admission_rejected",
             Self::NoProviderAvailable { .. } => "no_provider_available",
             Self::ProviderRateLimited { .. } => "provider_rate_limited",
             Self::ProviderTimeout { .. } => "provider_timeout",
@@ -92,6 +100,7 @@ impl AppError {
             | Self::Unauthorized { request_id, .. }
             | Self::Forbidden { request_id, .. }
             | Self::GatewayRateLimited { request_id, .. }
+            | Self::AdmissionRejected { request_id, .. }
             | Self::NoProviderAvailable { request_id }
             | Self::ProviderRateLimited { request_id }
             | Self::ProviderTimeout { request_id }
@@ -105,6 +114,7 @@ impl AppError {
             Self::InvalidRequest { message, .. } => message.clone(),
             Self::Unauthorized { message, .. } | Self::Forbidden { message, .. } => message.clone(),
             Self::GatewayRateLimited { .. } => "request rate limit exceeded, retry later".into(),
+            Self::AdmissionRejected { message, .. } => message.clone(),
             Self::NoProviderAvailable { .. } => "no provider is available for this request".into(),
             Self::ProviderRateLimited { .. } => "provider rate limited this request".into(),
             Self::ProviderTimeout { .. } => "provider timed out while handling this request".into(),
@@ -128,6 +138,10 @@ impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let retry_after = match &self {
             Self::GatewayRateLimited {
+                retry_after_seconds,
+                ..
+            } => Some(*retry_after_seconds),
+            Self::AdmissionRejected {
                 retry_after_seconds,
                 ..
             } => Some(*retry_after_seconds),
